@@ -1059,6 +1059,17 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
     const side_rows = try state.sideRowsFromEnv(geometry.piece_rows, o.context);
     if (side_rows != 0 and !residentEnabled()) return error.SideRowsNeedResident;
     if (side_rows != 0 and geometry.cache_format != .bf16) return error.SideRowsNeedBf16Cache;
+    if (p.world == 3) {
+        // TP=3 runs DCP=1: every rank keeps every position, so one rank's indexer scores the whole window, and the
+        // park, prefix-cache and ablation paths (which address slot p / 2 or sum two partials) do not apply.
+        const cap = state.dcp1MaxContext(geometry);
+        if (o.context > cap) {
+            std.log.err("TP=3 (DCP=1): the indexer scores at most {d} keys per rank, so --context must be <= {d} (got {d})", .{ cap, cap, o.context });
+            return error.Tp3ContextPastIndexLimit;
+        }
+        if (side_rows != 0) return error.Tp3SideRowsNeedDcp2;
+        if (prefixCacheSwitch()) return error.Tp3PrefixCacheNeedsDcp2;
+    }
     geometry.park_rows = side_rows;
     if (long_from != 0 and side_rows != 0) geometry.park_tail_slot = long_from / 2;
     if (p.rank == 0 and side_rows != 0) std.log.info("glm53 side rows: {d} (park {d:.2} GiB per rank)", .{ side_rows, state.gib(state.parkBytes(geometry.layers, geometry.full_index_layers, side_rows)) });
@@ -1220,6 +1231,7 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
     step.mark(gpa, io, "GLM modules + kernels");
     const ablate_path = o.ablate_file orelse if (std.c.getenv("TF_GLM53_ABLATE_FILE")) |v| std.mem.span(v) else null;
     if (ablate_path) |path| {
+        if (p.world == 3) return error.Tp3AblationNeedsDcp2;
         own.ablation = try ablate.Ablation.load(gpa, io, ctx.d, path, cfg.layers);
         own.alive_ablation = true;
         own.kernels.ablate = try own.modules.glm53_glue.function("tf_glm53_ablate_6144");

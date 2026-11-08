@@ -459,7 +459,26 @@ pub const PlaneBytes = struct { latent: u64, rope: u64, index: u64, slots: usize
 
 /// Position p lives at local slot p / 2 on rank p % 2. One extra slot permits the design's sentinel row.
 pub fn planeBytes(capacity: usize, layers: usize, full_index_layers: usize, format: CacheFormat) PlaneBytes {
-    const slots = (capacity + 1) / 2 + 1;
+    return planeBytesDcp(capacity, layers, full_index_layers, format, dcp_world);
+}
+
+/// The planes of `g`: TP=3 runs DCP=1, so every rank holds every position (slot p) and needs the full window.
+pub fn planeBytesFor(g: Geometry, capacity: usize) PlaneBytes {
+    return planeBytesDcp(capacity, g.layers, g.full_index_layers, g.cache_format, dcpWorld(g.world));
+}
+
+/// Rank-local cache rows for a window: DCP=2 splits positions by parity, DCP=1 keeps all of them.
+pub fn localSlots(capacity: usize, dcp_w: usize) usize {
+    return if (dcp_w == 1) capacity + 2 else (capacity + 1) / 2 + 1;
+}
+
+/// The largest window DCP=1 can serve: one rank's indexer scores every key, bounded by its slot table and top-k.
+pub fn dcp1MaxContext(g: Geometry) usize {
+    return @min(g.index_slots, index.max_local_keys);
+}
+
+pub fn planeBytesDcp(capacity: usize, layers: usize, full_index_layers: usize, format: CacheFormat, dcp_w: usize) PlaneBytes {
+    const slots = localSlots(capacity, dcp_w);
     const kv_element_bytes: u64 = if (format == .bf16) 2 else 1;
     const index_element_bytes: u64 = if (format == .bf16) 2 else 1;
     return .{
@@ -624,7 +643,7 @@ pub const Breakdown = struct {
 
 /// Logical bytes of every row (weights as given; State rows unrounded).
 pub fn breakdown(geometry: Geometry, context: usize, w: WeightClasses) Breakdown {
-    const planes = planeBytes(context, geometry.layers, geometry.full_index_layers, geometry.cache_format);
+    const planes = planeBytesFor(geometry, context);
     const lr = planes.latent + planes.rope;
     const stage = stagePlaneBytes(geometry, context);
     const prefill_weight = if (geometry.prefill_bf16) prefill_weight_scratch_bytes else 0;
@@ -643,7 +662,7 @@ pub fn breakdown(geometry: Geometry, context: usize, w: WeightClasses) Breakdown
 pub const StateArenas = struct { kv: u64, stage: u64, workspace: u64, park: u64 = 0 };
 
 pub fn stateArenas(geometry: Geometry, context: usize) StateArenas {
-    const planes = planeBytes(context, geometry.layers, geometry.full_index_layers, geometry.cache_format);
+    const planes = planeBytesFor(geometry, context);
     const kv = std.mem.alignForward(u64, planes.latent, tensor_alignment) + std.mem.alignForward(u64, planes.rope, tensor_alignment) + planes.index;
     const park_arena: u64 = if (geometry.park_rows == 0 or geometry.park_tail_slot != 0) 0 else arenaBytes(parkBytes(geometry.layers, geometry.full_index_layers, geometry.park_rows));
     return .{ .kv = arenaBytes(kv), .stage = arenaBytes(stagePlaneBytes(geometry, context)), .workspace = arenaBytes(workspaceLayout(geometry, context).bytes), .park = park_arena };
@@ -667,7 +686,7 @@ pub fn adaptNeedBytes(g: Geometry, context: usize) u64 {
 
 pub fn planAdapt(gpa: std.mem.Allocator, g: Geometry, context: usize, granularity: u64) !AdaptPlan {
     if (granularity == 0) return error.AdaptBadGranularity;
-    const p = planeBytes(context, g.layers, g.full_index_layers, g.cache_format);
+    const p = planeBytesFor(g, context);
     const elem: u64 = if (g.cache_format == .bf16) 2 else 1;
     const row_bytes = [_]u64{ @as(u64, mla.latent_dim) * elem, @as(u64, mla.rope_dim) * elem, @as(u64, index.dim) * elem };
     const plane_lens = [_]u64{ p.latent, p.rope, p.index };
@@ -695,7 +714,9 @@ pub fn planAdapt(gpa: std.mem.Allocator, g: Geometry, context: usize, granularit
             if (end > start) try tails.append(gpa, .{ .kv_offset = start, .len = end - start });
         }
     }
-    const maxpos = if (g.expert_rows_adapt_maxpos == 0) 2 * lo else @min(2 * lo, g.expert_rows_adapt_maxpos);
+    // A slot holds dcpWorld positions (p / 2 under DCP=2, p itself under TP=3's DCP=1).
+    const per_slot = dcpWorld(g.world);
+    const maxpos = if (g.expert_rows_adapt_maxpos == 0) per_slot * lo else @min(per_slot * lo, g.expert_rows_adapt_maxpos);
     return .{ .limit_slot = lo, .limit_position = maxpos, .need = need, .pool = adaptPool(lo, bases, counts, row_bytes, p.slots, granularity), .tails = try tails.toOwnedSlice(gpa), .kv_bytes = stateArenas(g, context).kv };
 }
 
@@ -1085,7 +1106,7 @@ pub const Workspace = struct {
         const batch_rows: u64 = if (grouped) @intCast(@min(g.expert_rows, @as(usize, @intCast(r)))) else pr;
         const hr: u64 = @intCast(g.head_rows);
         const k: u64 = @intCast(g.candidate_k);
-        const slots: u64 = @intCast(@min(g.index_slots, (context + 1) / 2 + 1));
+        const slots: u64 = @intCast(@min(g.index_slots, localSlots(context, dcpWorld(g.world))));
         var w: Workspace = undefined;
         w.adapt_big = false;
         w.rows = @intCast(r);
@@ -1517,7 +1538,7 @@ pub const State = struct {
             if (!builtin.is_test) std.log.err("GLM-5.3 after load: MemAvailable {d:.2} GiB less reserve {d:.2} GiB cannot hold State {d:.2} + graphs {d:.2} GiB", .{ gib(fresh_mem_available), gib(admission.reserve.bytes), gib(admission.state_bytes), gib(geometry.graphs_bytes) });
             return error.MemoryBudgetAfterLoad;
         }
-        const plane = planeBytes(context, geometry.layers, geometry.full_index_layers, geometry.cache_format);
+        const plane = planeBytesFor(geometry, context);
         if (geometry.park_tail_slot != 0 and !parkTailFits(geometry.park_tail_slot, geometry.park_rows / 2, plane.slots, null)) return error.LongTierParkTail;
         const layout = workspaceLayout(geometry, context);
         try validatePromptExpertsCarve(geometry.prompt_experts, &layout);
@@ -1897,7 +1918,7 @@ test "adaptive switches explicitly off preserve workspace and state geometry" {
 
 fn poolForTest(g: Geometry, context: usize, slots: usize, granularity: u64) u64 {
     // Independent oracle: walk every layer's region of each plane (layer-major, as State.latentAt).
-    const p = planeBytes(context, g.layers, g.full_index_layers, g.cache_format);
+    const p = planeBytesFor(g, context);
     const bases = [_]u64{ 0, std.mem.alignForward(u64, p.latent, tensor_alignment), std.mem.alignForward(u64, std.mem.alignForward(u64, p.latent, tensor_alignment) + p.rope, tensor_alignment) };
     const elem: u64 = if (g.cache_format == .bf16) 2 else 1;
     const rows = [_]u64{ mla.latent_dim * elem, mla.rope_dim * elem, index.dim * elem };
