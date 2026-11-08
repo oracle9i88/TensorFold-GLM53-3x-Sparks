@@ -51,6 +51,9 @@ pub const Layer = struct {
     gu_stride: usize = 0, // gate/up trellis row stride in tiles (0: contiguous per projection)
     limit: f32 = 0, // the SwiGLU clamp (0: none)
     act_mode: i32 = 0, // 0: GLM's bf16 roundings (the route RED-SNOW runs), 1: fp32
+    /// int32 [E] device table of each expert's width (GLM-5.3 TF_GLM53_MOE_BALANCE), or 0: every expert is `width`
+    /// wide. With a table `width` is the widest expert: the row stride of svh_g/svh_u/suh_d and of the down inputs.
+    widths: u64 = 0,
 };
 
 test {
@@ -205,6 +208,9 @@ pub const Experts = struct {
         std.debug.assert(l.experts >= 1 and l.experts <= 4096);
         const g_sk = try plan(d, w, true);
         const d_sk = try plan(w, d, false);
+        // A span table gives experts different down inputs: one split-K must divide every expert's (640 and 768 at
+        // d_sk 1, which plan picks for both); the kernel splits each expert's own k by sk and 4 warps.
+        if (l.widths != 0 and d_sk != 1) return error.Exl3PerExpertWidthsSplitK;
         const p = rows * slots;
         const maxu = @min(p, l.experts);
         const mt = (rows + 15) / 16;
@@ -262,6 +268,9 @@ pub const Experts = struct {
         g.add(@as(i32, 0));
         g.add(@as(i32, -1));
         g.add(@as(i32, l2_depth));
+        g.add(l.widths); // GroupedArgs.widths, xs, wmode: gate/up bound each expert's columns by the table
+        g.add(i32d(d));
+        g.add(@as(i32, if (l.widths != 0) 1 else 0));
         try launch_.launch(e.grouped[@backingInt(l.codebook)], .{ .grid = .{ .x = @intCast(maxu), .y = @intCast(w / 128), .z = @intCast(2 * g_sk * mt) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &g);
 
         var ep: launch_.Args = .{};
@@ -277,6 +286,7 @@ pub const Experts = struct {
         ep.add(i32d(l.experts));
         ep.add(l.limit);
         ep.add(l.act_mode);
+        ep.add(l.widths);
         try launch_.launch(e.gateup, .{ .grid = .{ .x = @intCast(p), .y = @intCast(w / 128), .z = 1 }, .block = .{ .x = 32, .y = 1, .z = 1 } }, s, &ep);
 
         var dn: launch_.Args = .{};
@@ -302,6 +312,9 @@ pub const Experts = struct {
         dn.add(@as(i32, 0));
         dn.add(@as(i32, -1));
         dn.add(@as(i32, l2_depth));
+        dn.add(l.widths); // down: each expert's inputs from the table, rows of xd `w` apart
+        dn.add(i32d(w));
+        dn.add(@as(i32, if (l.widths != 0) 2 else 0));
         try launch_.launch(e.grouped[@backingInt(l.codebook)], .{ .grid = .{ .x = @intCast(maxu), .y = @intCast(d / 128), .z = @intCast(d_sk * mt) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &dn);
 
         var cb: launch_.Args = .{};

@@ -50,9 +50,10 @@ __device__ __forceinline__ void ttile(int q, int cb, int& mat, int& nt) {
 }
 
 // Main loop: acc[i][nb] = warp tile i x members nb * 8 .. + 7 over K; XR rows a stage (TPM if X0 == X1, else 2 TPM).
+// K is the inputs this expert has, KX the row stride of X (K unless a span table makes experts' K differ).
 template <int MATS, int XR, int CB>
 __device__ __forceinline__ void tmain(const half* __restrict__ X0, const half* __restrict__ X1, const uint64_t* __restrict__ tp0,
-        const uint64_t* __restrict__ tp1, const int* rows_sh, int cnt, int e, int K, int NTILES, int cb, int xdiv,
+        const uint64_t* __restrict__ tp1, const int* rows_sh, int cnt, int e, int K, int KX, int NTILES, int cb, int xdiv,
         int k2a, int k2b, half* stage, float (&acc)[TMT][TNB][4]) {
     constexpr int SH = tstage_halves<XR>();
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -75,7 +76,7 @@ __device__ __forceinline__ void tmain(const half* __restrict__ X0, const half* _
             const int m = idx / (TPM * (TBK / 8)), rem = idx % (TPM * (TBK / 8)), i = rem / (TBK / 8), j = rem % (TBK / 8);
             if (i >= nblocks * 16) continue;   // a 16-member block without a member: never read
             const int r = rows_sh[i];
-            const half* src = (m ? X1 : X0) + (size_t)(r < 0 ? 0 : (r / xdiv)) * K + k0 + j * 8;
+            const half* src = (m ? X1 : X0) + (size_t)(r < 0 ? 0 : (r / xdiv)) * KX + k0 + j * 8;
             cp_async16(dst + ((size_t)m * TPM + i) * TXS + j * 8, src, r >= 0);
         }
         uint32_t* wdst = reinterpret_cast<uint32_t*>(dst + (size_t)XR * TXS);
@@ -161,16 +162,19 @@ template <int XR, int CB>
 __device__ __forceinline__ void tgateup(const half* __restrict__ Xg, const half* __restrict__ Xu, const uint64_t* __restrict__ Tg,
         const uint64_t* __restrict__ Tu, const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members,
         const half* __restrict__ svh_g, const half* __restrict__ svh_u, const half* __restrict__ suh_d, half* __restrict__ xd,
-        int K, int N, int xdiv, float limit, int act_mode, const int* k2g, const int* k2u, unsigned char* smem_raw, int* rows_sh) {
+        int K, int N, int xdiv, float limit, int act_mode, const int* k2g, const int* k2u, const int* widths,
+        unsigned char* smem_raw, int* rows_sh) {
     const int cb = TF_VBID.x, item = TF_VBID.y;
     if (item >= counts[0]) return;
     const int e = items[3 * item], first = items[3 * item + 1], cnt = items[3 * item + 2];
+    const int ne = widths ? widths[e] : N;   // this expert's columns; N stays the row stride of svh, suh_d and xd
+    if (cb * 128 >= ne) return;
     if (threadIdx.x < TPM) rows_sh[threadIdx.x] = (int)threadIdx.x < cnt ? members[first + threadIdx.x] : -1;
     TF_TASK_SYNC();
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     float acc[TMT][TNB][4];
     const int k2g_e = k2g[e], k2u_e = k2u[e];
-    tmain<2, XR, CB>(Xg, Xu, Tg, Tu, rows_sh, cnt, e, K, N >> 4, cb, xdiv, k2g_e, k2u_e, reinterpret_cast<half*>(smem_raw), acc);
+    tmain<2, XR, CB>(Xg, Xu, Tg, Tu, rows_sh, cnt, e, K, K, ne >> 4, cb, xdiv, k2g_e, k2u_e, reinterpret_cast<half*>(smem_raw), acc);
     float* Eg = reinterpret_cast<float*>(smem_raw);
     int mat, nt;
     ttile<2>(warp * TMT, cb, mat, nt);
@@ -245,9 +249,10 @@ __device__ __forceinline__ void wtile(int q, int cb, int& mat, int& nt) {
 }
 
 // Main loop: acc[nb] = this warp's tile x members nb * 8 .. + 7 over K; XR rows a stage (WPM if X0 == X1, else 2 WPM).
+// K is the inputs this expert has, KX the row stride of X (as tmain).
 template <int MATS, int TILES, int XR, int CB>
 __device__ __forceinline__ void wmain(const half* __restrict__ X0, const half* __restrict__ X1, const uint64_t* __restrict__ tp0,
-        const uint64_t* __restrict__ tp1, const int* rows_sh, int cnt, int e, int K, int NTILES, int cb, int xdiv,
+        const uint64_t* __restrict__ tp1, const int* rows_sh, int cnt, int e, int K, int KX, int NTILES, int cb, int xdiv,
         int k2a, int k2b, half* stage, float (&acc)[WNB][4]) {
     constexpr int THREADS = TILES * 32;
     constexpr int SH = wstage_halves<XR, TILES>();
@@ -271,7 +276,7 @@ __device__ __forceinline__ void wmain(const half* __restrict__ X0, const half* _
             const int m = idx / (WPM * (TBK / 8)), rem = idx % (WPM * (TBK / 8)), i = rem / (TBK / 8), j = rem % (TBK / 8);
             if (i >= nblocks * 16) continue;   // a 16-member block without a member: never read
             const int r = rows_sh[i];
-            const half* src = (m ? X1 : X0) + (size_t)(r < 0 ? 0 : (r / xdiv)) * K + k0 + j * 8;
+            const half* src = (m ? X1 : X0) + (size_t)(r < 0 ? 0 : (r / xdiv)) * KX + k0 + j * 8;
             cp_async16(dst + ((size_t)m * WPM + i) * TXS + j * 8, src, r >= 0);   // pad members: zeros
         }
         uint32_t* wdst = reinterpret_cast<uint32_t*>(dst + (size_t)XR * TXS);
@@ -346,20 +351,25 @@ __device__ __forceinline__ void wspill(float* E, int ES, int col0, const float (
 
 // Shared front of wup/wgate/wdown: the item (64-member items return: the _s kernels own them), its member rows, and
 // the main loop over one matrix. Returns the item's member count (0: nothing to do).
+// With a span table (TF_GLM53_MOE_BALANCE), wmode 1 (wup, wgate) bounds the expert's columns (blocks past them return
+// 0) and wmode 2 (wdown) its inputs; K and N stay the row strides.
 template <int CB>
 __device__ __forceinline__ int wfront(const half* __restrict__ X, const uint64_t* __restrict__ T, const int* __restrict__ items,
         const int* __restrict__ counts, const int* __restrict__ members, const int* __restrict__ k2s, int K, int N, int xdiv,
-        unsigned char* smem_raw, int* rows_sh, int& e, float (&acc)[WNB][4]) {
+        const int* __restrict__ widths, int wmode, unsigned char* smem_raw, int* rows_sh, int& e, float (&acc)[WNB][4]) {
     const int cb = TF_VBID.x, item = TF_VBID.y;
     if (item >= counts[0]) return 0;
     const int cnt = items[3 * item + 2];
     if (cnt <= TPM) return 0;
     e = items[3 * item];
+    const int ne = (widths && wmode == 1) ? widths[e] : N;
+    const int ke = (widths && wmode == 2) ? widths[e] : K;
+    if (cb * 128 >= ne) return 0;
     const int first = items[3 * item + 1];
     if (threadIdx.x < WPM) rows_sh[threadIdx.x] = (int)threadIdx.x < cnt ? members[first + threadIdx.x] : -1;
     TF_TASK_SYNC();
     const int k2 = k2s[e];
-    wmain<1, WTILES, WPM, CB>(X, X, T, T, rows_sh, cnt, e, K, N >> 4, cb, xdiv, k2, k2, reinterpret_cast<half*>(smem_raw), acc);
+    wmain<1, WTILES, WPM, CB>(X, X, T, T, rows_sh, cnt, e, ke, K, ne >> 4, cb, xdiv, k2, k2, reinterpret_cast<half*>(smem_raw), acc);
     return cnt;
 }
 
@@ -367,10 +377,11 @@ __device__ __forceinline__ int wfront(const half* __restrict__ X, const uint64_t
 template <int CB>
 __device__ __forceinline__ void wup(const half* __restrict__ Xu, const uint64_t* __restrict__ Tu, const int* __restrict__ items,
         const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_u, float* __restrict__ uu_out,
-        int K, int N, int xdiv, int act_mode, const int* __restrict__ k2u, unsigned char* smem_raw, int* rows_sh) {
+        int K, int N, int xdiv, int act_mode, const int* __restrict__ k2u, const int* __restrict__ widths,
+        unsigned char* smem_raw, int* rows_sh) {
     float acc[WNB][4];
     int e = 0;
-    const int cnt = wfront<CB>(Xu, Tu, items, counts, members, k2u, K, N, xdiv, smem_raw, rows_sh, e, acc);
+    const int cnt = wfront<CB>(Xu, Tu, items, counts, members, k2u, K, N, xdiv, widths, 1, smem_raw, rows_sh, e, acc);
     if (cnt == 0) return;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     float* Eu = reinterpret_cast<float*>(smem_raw);
@@ -404,10 +415,10 @@ template <int CB>
 __device__ __forceinline__ void wgate(const half* __restrict__ Xg, const uint64_t* __restrict__ Tg, const int* __restrict__ items,
         const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_g, const half* __restrict__ suh_d,
         const float* __restrict__ uu_in, half* __restrict__ xd, int K, int N, int xdiv, float limit, int act_mode,
-        const int* __restrict__ k2g, unsigned char* smem_raw, int* rows_sh) {
+        const int* __restrict__ k2g, const int* __restrict__ widths, unsigned char* smem_raw, int* rows_sh) {
     float acc[WNB][4];
     int e = 0;
-    const int cnt = wfront<CB>(Xg, Tg, items, counts, members, k2g, K, N, xdiv, smem_raw, rows_sh, e, acc);
+    const int cnt = wfront<CB>(Xg, Tg, items, counts, members, k2g, K, N, xdiv, widths, 1, smem_raw, rows_sh, e, acc);
     if (cnt == 0) return;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     float* Eg = reinterpret_cast<float*>(smem_raw);
@@ -452,10 +463,10 @@ __device__ __forceinline__ void wgate(const half* __restrict__ Xg, const uint64_
 template <int CB>
 __device__ __forceinline__ void wdown(const half* __restrict__ Xd, const uint64_t* __restrict__ Td, const int* __restrict__ items,
         const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d, float* __restrict__ y,
-        int K, int D, const int* __restrict__ k2d, unsigned char* smem_raw, int* rows_sh) {
+        int K, int D, const int* __restrict__ k2d, const int* __restrict__ widths, unsigned char* smem_raw, int* rows_sh) {
     float acc[WNB][4];
     int e = 0;
-    const int cnt = wfront<CB>(Xd, Td, items, counts, members, k2d, K, D, 1, smem_raw, rows_sh, e, acc);
+    const int cnt = wfront<CB>(Xd, Td, items, counts, members, k2d, K, D, 1, widths, 2, smem_raw, rows_sh, e, acc);
     if (cnt == 0) return;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     float* Ed = reinterpret_cast<float*>(smem_raw);

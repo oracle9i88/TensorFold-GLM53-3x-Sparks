@@ -939,16 +939,21 @@ fn routedCodebook(c: *const Config) experts.Codebook {
     };
 }
 
+/// TF_GLM53_MOE_BALANCE (Select.moe_balance), re-exported for native's switch checks.
+pub const MoeBalance = share_mod.MoeBalance;
+pub const moeBalanceFromEnv = share_mod.moeBalanceFromEnv;
+
 /// The largest per-projection host staging WP4's experts.load builds (trellis tiles of this rank), from headers.
-fn expertsHostBytes(L: *Loader, layer: usize, count: usize, dims: usize, lo: usize, hi: usize) !usize {
+fn expertsHostBytes(L: *Loader, layer: usize, count: usize, dims: usize, sh: share_mod.Share, balance: MoeBalance) !usize {
     var most: usize = 0;
     var nb: [320]u8 = undefined;
     for ([_][]const u8{ "gate_proj", "up_proj", "down_proj" }, 0..) |proj, pi| {
         var bytes: usize = 0;
         for (0..count) |e| {
             const t = try L.header(try std.fmt.bufPrint(&nb, "layers.{d}.mlp.experts.{d}.{s}.trellis", .{ layer, e, proj }));
-            const local_k = if (pi == 2) hi - lo else dims;
-            const local_n = if (pi == 2) dims else hi - lo;
+            const width = sh.moeForExpert(layer, e, balance).len();
+            const local_k = if (pi == 2) width else dims;
+            const local_n = if (pi == 2) dims else width;
             bytes += (local_k / 16) * (local_n / 16) * 16 * (t.dim(2) / 8);
         }
         most = @max(most, bytes);
@@ -957,9 +962,12 @@ fn expertsHostBytes(L: *Loader, layer: usize, count: usize, dims: usize, lo: usi
 }
 
 /// WP4 experts.load's exact uploads, from the headers only (plan mode): per projection the sliced trellis tiles,
-/// the pointer table, the K2 table and the suh/svh slices; every tensor it would read is marked used.
-fn planExperts(L: *Loader, layer: usize, count: usize, dims: usize, full_width: usize, lo: usize, hi: usize) !void {
+/// the pointer table, the K2 table and the suh/svh slices (span-sized ones at the widest span a expert); with
+/// TF_GLM53_MOE_BALANCE also the int32 span table. Every tensor it would read is marked used.
+fn planExperts(L: *Loader, layer: usize, count: usize, dims: usize, full_width: usize, sh: share_mod.Share, balance: MoeBalance) !void {
     const w = L.plan.?;
+    var stride: usize = 0;
+    for (0..count) |e| stride = @max(stride, sh.moeForExpert(layer, e, balance).len());
     for ([_][]const u8{ "gate_proj", "up_proj", "down_proj" }, 0..) |proj, pi| {
         const down = pi == 2;
         var trellis: u64 = 0;
@@ -968,19 +976,25 @@ fn planExperts(L: *Loader, layer: usize, count: usize, dims: usize, full_width: 
             const t = try L.header(try std.fmt.bufPrint(&nb, "layers.{d}.mlp.experts.{d}.{s}.trellis", .{ layer, e, proj }));
             if (t.rank != 3 or t.dim(2) % 8 != 0) return error.BadExpertTensor;
             const k2 = t.dim(2) / 8;
-            const local_k = if (down) hi - lo else dims;
-            const local_n = if (down) dims else hi - lo;
+            const width = sh.moeForExpert(layer, e, balance).len();
+            const local_k = if (down) width else dims;
+            const local_n = if (down) dims else width;
             trellis += (local_k / 16) * (local_n / 16) * 16 * k2;
             for ([_][]const u8{ "suh", "svh", "mcg", "mcg_e4m3", "mul1" }) |part| {
                 const raw = try std.fmt.bufPrint(&nb, "layers.{d}.mlp.experts.{d}.{s}.{s}", .{ layer, e, proj, part });
                 if (L.hasRaw(raw)) _ = try L.header(raw);
             }
         }
-        const suh: u64 = count * (if (down) hi - lo else dims) * 2;
-        const svh: u64 = count * (if (down) dims else hi - lo) * 2;
+        const suh: u64 = count * (if (down) stride else dims) * 2;
+        const svh: u64 = count * (if (down) dims else stride) * 2;
         // Five puts a projection (trellis, pointers, K2, suh, svh), each placed in the routed arena.
         w.routed += placed(trellis) + placed(count * 8) + placed(count * 4) + placed(suh) + placed(svh);
         if (L.plan_logical) |lw| lw.routed += trellis + count * 8 + count * 4 + suh + svh;
+    }
+    if (balance != .off) {
+        // experts.loadSpans' sixth put: the span table
+        w.routed += placed(count * 4);
+        if (L.plan_logical) |lw| lw.routed += count * 4;
     }
     _ = full_width;
 }
@@ -1051,20 +1065,31 @@ fn loadLayer(L: *Loader, c: *const Config, sh: share_mod.Share, i: usize) !Devic
     m.router = try plain(L, try std.fmt.bufPrint(&nb, "{s}mlp.gate.weight", .{p}), null, null, .bf16);
     m.bias = try plain(L, try std.fmt.bufPrint(&nb, "{s}mlp.gate.e_score_correction_bias", .{p}), null, null, .f32);
     const moe_span = sh.moeForLayer(i);
+    const balance = L.select.moe_balance;
     if (L.plan != null) {
-        try planExperts(L, i, c.experts, c.hidden, c.moe_inter, moe_span.lo, moe_span.hi);
+        try planExperts(L, i, c.experts, c.hidden, c.moe_inter, sh, balance);
         m.routed = undefined;
     } else {
         // One exact reservation for WP4's host staging (the largest projection's rank half), so the ArrayList never
         // grows by doubling through about 0.4 GiB (review N9). experts.load reads at most 5 tensors per expert before
         // it consumes them; the O_DIRECT ring holds Direct.ring_len = 8.
-        try L.host.ensureTotalCapacityPrecise(L.gpa, try expertsHostBytes(L, i, c.experts, c.hidden, moe_span.lo, moe_span.hi));
+        try L.host.ensureTotalCapacityPrecise(L.gpa, try expertsHostBytes(L, i, c.experts, c.hidden, sh, balance));
         L.hold_host = true;
         defer {
             L.hold_host = false;
             L.trimHost();
         }
-        m.routed = try experts.load(L, i, c.experts, c.hidden, c.moe_inter, moe_span.lo, moe_span.hi, routedCodebook(c));
+        if (balance == .off) {
+            m.routed = try experts.load(L, i, c.experts, c.hidden, c.moe_inter, moe_span.lo, moe_span.hi, routedCodebook(c));
+        } else {
+            const spans = try L.gpa.alloc(experts.Span, c.experts);
+            defer L.gpa.free(spans);
+            for (spans, 0..) |*sp, e| {
+                const s = sh.moeForExpert(i, e, balance);
+                sp.* = .{ .lo = s.lo, .hi = s.hi };
+            }
+            m.routed = try experts.loadSpans(L, i, c.experts, c.hidden, c.moe_inter, spans, true, routedCodebook(c));
+        }
     }
     const shared_span = sh.sharedForLayer(i);
     const shared: Span = .{ .lo = shared_span.lo, .hi = shared_span.hi };
@@ -1086,6 +1111,8 @@ pub const Select = struct {
     manifest: ?*const manifest_mod.Manifest = null,
     /// Load only this TP rank's q_a and kv_a output rows.
     shard_qkv_a: bool = false,
+    /// TF_GLM53_MOE_BALANCE: how the routed experts' intermediate channels split over three ranks (share.zig).
+    moe_balance: share_mod.MoeBalance = .off,
 
     /// Bring-up (design §7 L1 at TP2 + DCP2): the first `count` layers and the globals.
     pub fn bringUp(store: []usize, count: usize) Select {

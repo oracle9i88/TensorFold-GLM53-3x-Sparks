@@ -42,6 +42,14 @@ pub const Share = struct {
         return s.moe;
     }
 
+    /// Routed expert `expert`'s channels on this rank under TF_GLM53_MOE_BALANCE: `.expert` rotates the six-block
+    /// share by expert as well as by layer (k = (expert + layer) % 3), so the eight experts a row picks spread their big
+    /// shares over the three ranks instead of all landing on layer % 3; `.layer` keeps moeForLayer's split.
+    pub fn moeForExpert(s: Share, layer: usize, expert: usize, balance: MoeBalance) Span {
+        if (s.world == 3 and balance == .expert) return spanMoeRotated(s.rank, (expert + layer) % 3);
+        return s.moeForLayer(layer);
+    }
+
     pub fn sharedForLayer(s: Share, layer: usize) Span {
         if (s.world == 3) {
             return spanMoeRotated(s.rank, (layer + 1) % 3);
@@ -49,6 +57,24 @@ pub const Share = struct {
         return s.shared;
     }
 };
+
+/// TF_GLM53_MOE_BALANCE: unset or "off" loads the routed experts as before (one span a layer); "layer" loads the same
+/// spans through the per-expert path (span table and per-expert kernels; must reproduce "off" bit for bit); "expert"
+/// rotates each expert's six-block share (Share.moeForExpert). Three ranks only.
+pub const MoeBalance = enum { off, layer, expert };
+
+pub fn moeBalanceSelected(value: ?[]const u8) !MoeBalance {
+    const raw = value orelse return .off;
+    if (raw.len == 0 or std.mem.eql(u8, raw, "off")) return .off;
+    if (std.mem.eql(u8, raw, "layer")) return .layer;
+    if (std.mem.eql(u8, raw, "expert")) return .expert;
+    return error.BadMoeBalance;
+}
+
+pub fn moeBalanceFromEnv() !MoeBalance {
+    const v = std.c.getenv("TF_GLM53_MOE_BALANCE") orelse return .off;
+    return moeBalanceSelected(std.mem.span(v));
+}
 
 /// Rotated TP=3 MoE expert intermediate channels across layers (k = (layer + offset) % 3).
 pub fn spanMoeRotated(rank: usize, k: usize) Span {
@@ -165,4 +191,33 @@ test "TP3 owns 22/22/20 heads, 6/5/5 halves, 4096 dense, and 51712/51584/51584 v
     try std.testing.expectEqual(Span{ .lo = 51712, .hi = 103296 }, r1.vocab);
     try std.testing.expectEqual(Span{ .lo = 103296, .hi = 154880 }, r2.vocab);
     try std.testing.expectError(error.BadRank, Share.of(&c, 3, 3));
+}
+
+test "TF_GLM53_MOE_BALANCE=expert: every expert's three spans tile 2048 in 128 blocks, big shares a third a rank" {
+    const c = Config{};
+    var sh: [3]Share = undefined;
+    for (&sh, 0..) |*s, r| s.* = try Share.of(&c, r, 3);
+    for (0..78) |layer| {
+        var big: [3]usize = .{ 0, 0, 0 };
+        for (0..256) |e| {
+            var at: usize = 0;
+            for (sh, 0..) |s, r| {
+                const span = s.moeForExpert(layer, e, .expert);
+                try std.testing.expectEqual(at, span.lo); // ranks in order, no gap, no overlap
+                try std.testing.expect(span.lo % 128 == 0 and span.hi % 128 == 0);
+                try std.testing.expect(span.len() == 768 or span.len() == 640);
+                if (span.len() == 768) big[r] += 1;
+                at = span.hi;
+            }
+            try std.testing.expectEqual(@as(usize, 2048), at);
+        }
+        for (big) |b| try std.testing.expect(b == 85 or b == 86);
+        // .layer and .off keep the layer's one span for every expert
+        for (sh) |s| for ([_]usize{ 0, 7, 255 }) |e| try std.testing.expectEqual(s.moeForLayer(layer), s.moeForExpert(layer, e, .layer));
+    }
+    try std.testing.expectEqual(MoeBalance.off, try moeBalanceSelected(null));
+    try std.testing.expectEqual(MoeBalance.off, try moeBalanceSelected("off"));
+    try std.testing.expectEqual(MoeBalance.layer, try moeBalanceSelected("layer"));
+    try std.testing.expectEqual(MoeBalance.expert, try moeBalanceSelected("expert"));
+    try std.testing.expectError(error.BadMoeBalance, moeBalanceSelected("experts"));
 }

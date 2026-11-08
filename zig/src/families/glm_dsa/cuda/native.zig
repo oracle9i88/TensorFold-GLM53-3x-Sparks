@@ -1090,7 +1090,19 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
     geometry_without_overlay.scratch_overlay = false;
     std.log.info("TF_GLM53_SCRATCH_OVERLAY={s}: workspace total {d} bytes (without overlay {d} bytes)", .{ if (scratch_overlay) "on" else "off", state.workspaceLayout(geometry, o.context).bytes, state.workspaceLayout(geometry_without_overlay, o.context).bytes });
 
-    const selection: weights.Select = .{ .manifest = if (mf) |*m| m else null, .shard_qkv_a = shard_qkv_a };
+    const moe_balance = try weights.moeBalanceFromEnv();
+    if (moe_balance != .off) {
+        if (p.world != 3) {
+            std.log.err("TF_GLM53_MOE_BALANCE={s} splits the routed experts over three ranks; this run has {d}", .{ @tagName(moe_balance), p.world });
+            return error.MoeBalanceNeedsThreeRanks;
+        }
+        if (forward.megakernelSwitch()) {
+            std.log.err("TF_GLM53_MOE_BALANCE={s}: the megakernel's expert tasks assume one span a layer; set TF_GLM53_MK=0", .{@tagName(moe_balance)});
+            return error.MoeBalanceWithMegakernel;
+        }
+        std.log.info("TF_GLM53_MOE_BALANCE={s}: routed experts load with a span table ({s})", .{ @tagName(moe_balance), if (moe_balance == .expert) "six-block share rotated by expert and layer" else "one span a layer, per-expert kernels" });
+    }
+    const selection: weights.Select = .{ .manifest = if (mf) |*m| m else null, .shard_qkv_a = shard_qkv_a, .moe_balance = moe_balance };
     var plan = try weights.planRank(gpa, io, dir, cfg, p.rank, p.world, selection);
     defer plan.deinit(gpa);
     var drafter_geometry: ?drafts.Geometry = null;
@@ -1897,6 +1909,12 @@ fn settingsDigest(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, o: Option
     if (side_rows != 0) {
         hash.update("TF_GLM53_SIDE_ROWS=");
         hash.update(std.mem.asBytes(&side_rows));
+    }
+    // the split changes every rank's routed work, so timings recorded under another split do not carry over
+    const moe_balance = try weights.moeBalanceFromEnv();
+    if (moe_balance != .off) {
+        hash.update("TF_GLM53_MOE_BALANCE=");
+        hash.update(@tagName(moe_balance));
     }
     try hashPrefixCacheSwitch(&hash, prefixCacheSwitch(), try expertRows());
     hashPromptExperts(&hash, prompt_experts);

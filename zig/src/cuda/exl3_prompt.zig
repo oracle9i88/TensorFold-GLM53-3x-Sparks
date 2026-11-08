@@ -156,6 +156,7 @@ pub const Kernels = struct {
     /// =3 uses the same 128-member plan and rotation as =2. Small items retain =1 gate/up;
     /// larger items use fused PMX gate/up, followed by =2 down and combine.
     pub fn runPmx(k: Kernels, pmx: *const pmx_mod.Pmx, e: *const ex.Experts, router: grouped.Router, s: Stream, l: ex.Layer, x: u64, stride: usize, picks: u64, rows: usize, sc: Scratch, p: grouped.Plan) !void {
+        if (l.widths != 0) return error.Exl3PerExpertWidthsUnsupported; // pmx.cu reads one width for every expert
         if (l.width > l.dims) return error.Exl3Shape;
         if (k.wide == null) return error.Exl3PromptWideMissing;
         try k.prepare(e, router, s, l, x, stride, picks, rows, sc, p, wide_tile);
@@ -174,6 +175,7 @@ pub const Kernels = struct {
     /// TF_GLM53_PROMPT_EXPERTS=10 gate/up: =3's 128-member plan; items <= 64 members on p5a, larger ones on =3 PMX.
     pub fn gateUpP5a(k: Kernels, pmx: *const pmx_mod.Pmx, small: *const p5a_mod.P5a, s: Stream, l: ex.Layer, rows: usize, sc: Scratch, p: grouped.Plan) !void {
         _ = k;
+        if (l.widths != 0) return error.Exl3PerExpertWidthsUnsupported; // p5a.cu and pmx.cu read one width
         const c: usize = if (l.codebook == .mcg_e4m3) 1 else 0;
         const items = grouped.maxItems(rows * sc.slots, l.experts, wide_tile);
         try go(small.gu[c], s, .{ l.width / 128, items, 1 }, p5a_mod.threads, guArgs(l, sc, p));
@@ -185,11 +187,12 @@ pub const Kernels = struct {
 
     /// =10 down: items <= 64 members on p5a, larger ones on =2's wide down.
     pub fn downP5a(k: Kernels, small: *const p5a_mod.P5a, s: Stream, l: ex.Layer, rows: usize, sc: Scratch, p: grouped.Plan) !void {
+        if (l.widths != 0) return error.Exl3PerExpertWidthsUnsupported; // p5a.cu reads one width
         const w = k.wide orelse return error.Exl3PromptWideMissing;
         const c: usize = if (l.codebook == .mcg_e4m3) 1 else 0;
         const items = grouped.maxItems(rows * sc.slots, l.experts, wide_tile);
         try go(small.down[c], s, .{ l.dims / 256, items, 1 }, p5a_mod.threads, downArgs(l, sc, p));
-        try goShared(w.down[c], s, .{ l.dims / 128, items, 1 }, wide_threads, wide_smem, .{ sc.xd, l.down, p.items, p.counts, p.members, l.svh_d, sc.y, i(l.width), i(l.dims), l.down_k2 });
+        try goShared(w.down[c], s, .{ l.dims / 128, items, 1 }, wide_threads, wide_smem, .{ sc.xd, l.down, p.items, p.counts, p.members, l.svh_d, sc.y, i(l.width), i(l.dims), l.down_k2, l.widths });
     }
 
     /// =10 is =3 (same plan, rotation, PMX gate/up and wide down) with p5a for its small items; every output has =3's
@@ -255,8 +258,8 @@ pub const Kernels = struct {
         const items = grouped.maxItems(rows * sc.slots, l.experts, wide_tile);
         const xdiv = i(if (l.shared_input) sc.slots else 1);
         try go(w.gu_small[c], s, .{ l.width / 128, items, 1 }, 256, guArgs(l, sc, p));
-        try goShared(w.up[c], s, .{ l.width / 128, items, 1 }, wide_threads, wide_smem, .{ sc.xu, l.up, p.items, p.counts, p.members, l.svh_u, sc.uu, i(l.dims), i(l.width), xdiv, l.act_mode, l.up_k2 });
-        try goShared(w.gate[c], s, .{ l.width / 128, items, 1 }, wide_threads, wide_smem, .{ sc.xg, l.gate, p.items, p.counts, p.members, l.svh_g, l.suh_d, sc.uu, sc.xd, i(l.dims), i(l.width), xdiv, l.limit, l.act_mode, l.gate_k2 });
+        try goShared(w.up[c], s, .{ l.width / 128, items, 1 }, wide_threads, wide_smem, .{ sc.xu, l.up, p.items, p.counts, p.members, l.svh_u, sc.uu, i(l.dims), i(l.width), xdiv, l.act_mode, l.up_k2, l.widths });
+        try goShared(w.gate[c], s, .{ l.width / 128, items, 1 }, wide_threads, wide_smem, .{ sc.xg, l.gate, p.items, p.counts, p.members, l.svh_g, l.suh_d, sc.uu, sc.xd, i(l.dims), i(l.width), xdiv, l.limit, l.act_mode, l.gate_k2, l.widths });
     }
 
     /// =2's down: items <= 64 members on =1's kernel, larger ones on 128-column wide blocks.
@@ -270,19 +273,21 @@ pub const Kernels = struct {
         };
         const items = grouped.maxItems(rows * sc.slots, l.experts, wide_tile);
         try go(w.down_small[c], s, .{ l.dims / 256, items, 1 }, 256, downArgs(l, sc, p));
-        try goShared(w.down[c], s, .{ l.dims / 128, items, 1 }, wide_threads, wide_smem, .{ sc.xd, l.down, p.items, p.counts, p.members, l.svh_d, sc.y, i(l.width), i(l.dims), l.down_k2 });
+        try goShared(w.down[c], s, .{ l.dims / 128, items, 1 }, wide_threads, wide_smem, .{ sc.xd, l.down, p.items, p.counts, p.members, l.svh_d, sc.y, i(l.width), i(l.dims), l.down_k2, l.widths });
     }
 };
 
 fn guArgs(l: ex.Layer, sc: Scratch, p: grouped.Plan) GuArgs {
-    return .{ sc.xg, sc.xu, l.gate, l.up, p.items, p.counts, p.members, l.svh_g, l.svh_u, l.suh_d, sc.xd, i(l.dims), i(l.width), i(if (l.shared_input) sc.slots else 1), l.limit, l.act_mode, l.gate_k2, l.up_k2 };
+    return .{ sc.xg, sc.xu, l.gate, l.up, p.items, p.counts, p.members, l.svh_g, l.svh_u, l.suh_d, sc.xd, i(l.dims), i(l.width), i(if (l.shared_input) sc.slots else 1), l.limit, l.act_mode, l.gate_k2, l.up_k2, l.widths };
 }
-const GuArgs = struct { u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, i32, i32, i32, f32, i32, u64, u64 };
+// The last entry is the span table (exl3_prompt kernels' `widths`); p5a's small gate/up does not declare it and the
+// driver passes only the parameters a kernel has.
+const GuArgs = struct { u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, i32, i32, i32, f32, i32, u64, u64, u64 };
 
 fn downArgs(l: ex.Layer, sc: Scratch, p: grouped.Plan) DownArgs {
-    return .{ sc.xd, l.down, p.items, p.counts, p.members, l.svh_d, sc.y, i(l.width), i(l.dims), i(sc.slots), l.down_k2 };
+    return .{ sc.xd, l.down, p.items, p.counts, p.members, l.svh_d, sc.y, i(l.width), i(l.dims), i(sc.slots), l.down_k2, l.widths };
 }
-const DownArgs = struct { u64, u64, u64, u64, u64, u64, u64, i32, i32, i32, u64 };
+const DownArgs = struct { u64, u64, u64, u64, u64, u64, u64, i32, i32, i32, u64, u64 };
 
 test "wide prompt kernels: tiles, threads and dynamic shared memory match exl3_prompt.cuh; 2 CTAs an SM fit" {
     try std.testing.expectEqual(@as(u32, 36_864), wide_smem);

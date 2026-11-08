@@ -93,6 +93,9 @@ pub const Grouped = struct {
             args.add(@as(i32, @intCast(v)));
         args.add(skip);
         args.add(@as(i32, ex.l2_depth));
+        args.add(@as(u64, 0)); // GroupedArgs.widths, xs, wmode: one width for every expert here
+        args.add(@as(i32, @intCast(k)));
+        args.add(@as(i32, 0));
         try launch.launch(g.kernels.grouped[@backingInt(w.codebook)], .{ .grid = .{ .x = @intCast(items), .y = @intCast(n / 128), .z = @intCast(mats * sk * 4) }, .block = .{ .x = 128 } }, s, &args);
         var finish: launch.Args = .{};
         finish.add(a);

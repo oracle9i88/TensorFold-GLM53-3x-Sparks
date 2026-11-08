@@ -12,6 +12,23 @@ pub const Experts = ex.Experts;
 pub const Scratch = ex.Scratch;
 const Projection = struct { ptrs: u64, k2_ptr: u64, suh_ptr: u64, svh_ptr: u64, uniform_k2: u32, widths_ok: bool, pmx_ok: bool };
 
+/// One expert's intermediate channels on this rank (128-aligned: EXL3's Hadamard blocks are 128 wide).
+pub const Span = struct {
+    lo: usize,
+    hi: usize,
+
+    pub fn len(s: Span) usize {
+        return s.hi - s.lo;
+    }
+};
+
+/// The widest expert span: the row stride of the per-expert svh (gate/up), suh (down) and the down inputs.
+pub fn widest(spans: []const Span) usize {
+    var most: usize = 0;
+    for (spans) |s| most = @max(most, s.len());
+    return most;
+}
+
 pub const Loaded = struct {
     gate: u64,
     up: u64,
@@ -30,8 +47,10 @@ pub const Loaded = struct {
     widths_ok: bool,
     pmx_ok: bool = false,
     dims: usize,
-    width: usize,
+    width: usize, // the widest expert's span (every expert's when they are equal)
     experts: usize,
+    /// int32 [E] device table of each expert's span width, or 0 when every expert has `width` (TF_GLM53_MOE_BALANCE).
+    widths: u64 = 0,
 
     pub fn layer(w: Loaded) ex.Layer {
         return .{
@@ -55,6 +74,7 @@ pub const Loaded = struct {
             .widths_ok = w.widths_ok,
             .pmx_ok = w.pmx_ok,
             .act_mode = 0,
+            .widths = w.widths,
         };
     }
 };
@@ -65,10 +85,13 @@ fn alignAppend(L: anytype, bytes: []const u8, alignment: usize) !void {
     try L.host.appendSlice(L.gpa, bytes);
 }
 
-/// Load a routed projection from the Python reader's canonical names. `lo..hi` is the rank's intermediate span.
-/// The trellis's last dimension gives K2 independently for every expert and every projection.
-fn projection(L: anytype, layer_index: usize, expert_count: usize, dims: usize, full_width: usize, lo: usize, hi: usize, routed_codebook: Codebook, comptime name: []const u8, down: bool) !Projection {
-    if (lo >= hi or hi > full_width or dims % 128 != 0 or full_width % 128 != 0 or lo % 128 != 0 or hi % 128 != 0)
+/// Load a routed projection from the Python reader's canonical names. `spans[e]` is expert e's intermediate span on
+/// this rank. The trellis's last dimension gives K2 independently for every expert and every projection. The span-sized
+/// scales (svh for gate/up, suh for down) sit `stride` apart per expert, zero past the span: with equal spans the
+/// stride is the span and the bytes are what a single lo..hi gave.
+fn projection(L: anytype, layer_index: usize, expert_count: usize, dims: usize, full_width: usize, spans: []const Span, stride: usize, routed_codebook: Codebook, comptime name: []const u8, down: bool) !Projection {
+    if (spans.len != expert_count or dims % 128 != 0 or full_width % 128 != 0 or stride % 128 != 0) return error.BadExpertSpan;
+    for (spans) |sp| if (sp.lo >= sp.hi or sp.hi > full_width or sp.lo % 128 != 0 or sp.hi % 128 != 0 or sp.len() > stride)
         return error.BadExpertSpan;
     try alignAppend(L, &.{}, 256);
     const trellis_host_base = L.host.items.len;
@@ -82,6 +105,8 @@ fn projection(L: anytype, layer_index: usize, expert_count: usize, dims: usize, 
     defer ptrs.deinit(L.gpa);
 
     for (0..expert_count) |e| {
+        const lo = spans[e].lo;
+        const hi = spans[e].hi;
         const t = try L.get("layers.{d}.mlp.experts.{d}." ++ name ++ ".trellis", .{ layer_index, e });
         const s = if (L.has("layers.{d}.mlp.experts.{d}." ++ name ++ ".suh", .{ layer_index, e }))
             try L.get("layers.{d}.mlp.experts.{d}." ++ name ++ ".suh", .{ layer_index, e })
@@ -146,10 +171,12 @@ fn projection(L: anytype, layer_index: usize, expert_count: usize, dims: usize, 
         }
         if (down) {
             try suh.appendSlice(L.gpa, s.bytes[lo * 2 .. hi * 2]);
+            try suh.appendNTimes(L.gpa, 0, (stride - (hi - lo)) * 2);
             try svh.appendSlice(L.gpa, v.bytes);
         } else {
             try suh.appendSlice(L.gpa, s.bytes);
             try svh.appendSlice(L.gpa, v.bytes[lo * 2 .. hi * 2]);
+            try svh.appendNTimes(L.gpa, 0, (stride - (hi - lo)) * 2);
         }
         try ptrs.append(L.gpa, 0);
         try k2.append(L.gpa, bits2);
@@ -159,8 +186,8 @@ fn projection(L: anytype, layer_index: usize, expert_count: usize, dims: usize, 
     var at: usize = 0;
     for (0..expert_count) |e| {
         ptrs.items[e] = @intCast(trellis_host_base + at);
-        const local_n = if (down) dims else hi - lo;
-        const local_k = if (down) hi - lo else dims;
+        const local_n = if (down) dims else spans[e].len();
+        const local_k = if (down) spans[e].len() else dims;
         at += (local_k / 16) * (local_n / 16) * @as(usize, @intCast(k2.items[e])) * 16;
     }
     const trellis_base = try L.put("layers.{d}.moe.exl3." ++ name ++ "_trellis", .{layer_index});
@@ -184,11 +211,31 @@ fn projection(L: anytype, layer_index: usize, expert_count: usize, dims: usize, 
 
 /// Append the mixed-width EXL3 tensors for one expert layer. `routed_codebook` is explicit for packs marked `.mcg`.
 pub fn load(L: anytype, layer_index: usize, expert_count: usize, dims: usize, full_width: usize, lo: usize, hi: usize, routed_codebook: Codebook) !Loaded {
+    const spans = try L.gpa.alloc(Span, expert_count);
+    defer L.gpa.free(spans);
+    @memset(spans, .{ .lo = lo, .hi = hi });
+    return loadSpans(L, layer_index, expert_count, dims, full_width, spans, false, routed_codebook);
+}
+
+/// load with a span an expert (TF_GLM53_MOE_BALANCE). `with_widths` uploads the int32 [E] span widths the kernels
+/// read; without it every span must be equal (load's case, the bytes and the launches of before).
+pub fn loadSpans(L: anytype, layer_index: usize, expert_count: usize, dims: usize, full_width: usize, spans: []const Span, with_widths: bool, routed_codebook: Codebook) !Loaded {
     if (routed_codebook != .mcg and routed_codebook != .mcg_e4m3 and routed_codebook != .mul1) return error.BadExpertCodebook;
-    const g = try projection(L, layer_index, expert_count, dims, full_width, lo, hi, routed_codebook, "gate_proj", false);
-    const u = try projection(L, layer_index, expert_count, dims, full_width, lo, hi, routed_codebook, "up_proj", false);
-    const d = try projection(L, layer_index, expert_count, dims, full_width, lo, hi, routed_codebook, "down_proj", true);
-    return .{ .gate = g.ptrs, .up = u.ptrs, .down = d.ptrs, .gate_k2 = g.k2_ptr, .up_k2 = u.k2_ptr, .down_k2 = d.k2_ptr, .suh_g = g.suh_ptr, .suh_u = u.suh_ptr, .svh_g = g.svh_ptr, .svh_u = u.svh_ptr, .suh_d = d.suh_ptr, .svh_d = d.svh_ptr, .codebook = routed_codebook, .uniform_k2 = if (g.uniform_k2 == 8 and u.uniform_k2 == 8 and d.uniform_k2 == 8) 8 else 0, .widths_ok = g.widths_ok and u.widths_ok and d.widths_ok, .pmx_ok = g.pmx_ok and u.pmx_ok and d.pmx_ok, .dims = dims, .width = hi - lo, .experts = expert_count };
+    if (spans.len != expert_count or expert_count == 0) return error.BadExpertSpan;
+    const stride = widest(spans);
+    if (!with_widths) for (spans) |sp| if (sp.len() != stride) return error.BadExpertSpan;
+    const g = try projection(L, layer_index, expert_count, dims, full_width, spans, stride, routed_codebook, "gate_proj", false);
+    const u = try projection(L, layer_index, expert_count, dims, full_width, spans, stride, routed_codebook, "up_proj", false);
+    const d = try projection(L, layer_index, expert_count, dims, full_width, spans, stride, routed_codebook, "down_proj", true);
+    var widths: u64 = 0;
+    if (with_widths) {
+        const table = try L.gpa.alloc(i32, expert_count);
+        defer L.gpa.free(table);
+        for (table, spans) |*t, sp| t.* = @intCast(sp.len());
+        try alignAppend(L, std.mem.sliceAsBytes(table), 256);
+        widths = try L.put("layers.{d}.moe.exl3.widths", .{layer_index});
+    }
+    return .{ .gate = g.ptrs, .up = u.ptrs, .down = d.ptrs, .gate_k2 = g.k2_ptr, .up_k2 = u.k2_ptr, .down_k2 = d.k2_ptr, .suh_g = g.suh_ptr, .suh_u = u.suh_ptr, .svh_g = g.svh_ptr, .svh_u = u.svh_ptr, .suh_d = d.suh_ptr, .svh_d = d.svh_ptr, .codebook = routed_codebook, .uniform_k2 = if (g.uniform_k2 == 8 and u.uniform_k2 == 8 and d.uniform_k2 == 8) 8 else 0, .widths_ok = g.widths_ok and u.widths_ok and d.widths_ok, .pmx_ok = g.pmx_ok and u.pmx_ok and d.pmx_ok, .dims = dims, .width = stride, .experts = expert_count, .widths = widths };
 }
 
 /// Decode path: run all routed slots and let the caller perform the ordered fp32 route reduction.
