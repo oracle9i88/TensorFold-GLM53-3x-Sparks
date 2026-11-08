@@ -610,6 +610,7 @@ pub const Stage = enum {
     routed,
     shared,
     lowrank,
+    moe_post, // decode side-stream path: the routed + shared combine after the side stream joins
     moe_comm,
     dense_mlp,
     dense_comm,
@@ -2823,9 +2824,17 @@ pub const Forward = struct {
                     try side.wait(f.st.fork2.?);
                     // Side MLP uses the ordinary MLP scratch: the main route and EXL3 expert path touch router,
                     // pick, expert and routed-output regions, which are disjoint from gate_up/activation/lane_part.
+                    // TF_GLM53_PROFILE times route and routed on the main stream and shared on the side stream (they
+                    // overlap: the window pays the longer of routed and shared, then moe_post).
+                    try f.profileBegin(mode, l.index, .route);
                     try moe.route(k.router(), s, xn, hidden, m.router, m.bias, ws.router_logits, ws.router_part, ws.picks, ws.wts, n);
+                    try f.profileEnd(mode, l.index, .route);
+                    try f.profileBegin(mode, l.index, .routed);
                     try runRouted(&routed, s, xn, hidden, ws.picks, ws.wts, n, routed_out);
+                    try f.profileEnd(mode, l.index, .routed);
+                    try f.profileBeginStream(mode, l.index, .shared, side);
                     try mlp.block(mlp_k, side, m.shared, scratch, xn, n, m.shared.down.k, ws.shared_out);
+                    try f.profileEndStream(mode, l.index, .shared, side);
                     // The low-rank partial/reduce that moe.block runs (review of 2b9a090e: without it blockPost combined
                     // stale lowrank_mid). lowrank_mid is disjoint from the main route/expert scratch.
                     var lowrank_k = k.glue53;
@@ -2833,7 +2842,9 @@ pub const Forward = struct {
                     if (lr) |w| try moe.lowrankPre(lowrank_k, side, xn, hidden, n, w);
                     try (f.st.shared orelse return error.MissingDecodeSideEvents).record(side);
                     try s.wait(f.st.shared.?);
+                    try f.profileBegin(mode, l.index, .moe_post);
                     try moe.blockPost(lowrank_k, s, routed_out, ws.shared_out, lr, n, moe_out);
+                    try f.profileEnd(mode, l.index, .moe_post);
                 } else {
                     var timing: MoeProfile = .{ .f = f, .layer = l.index, .mode = mode };
                     const hooks: ?moe.ProfileHooks = if ((mode == .decode or (mode == .prefill and f.prof_prefill)) and f.prof != null) .{ .ctx = @ptrCast(&timing), .begin_fn = moeProfileBegin, .end_fn = moeProfileEnd } else null;
