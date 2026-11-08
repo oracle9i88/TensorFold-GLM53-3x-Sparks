@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
-//! A tensor-parallel group over NCCL (NCCL_COMM_ID; rows in rank order); two ranks add RoCE small gathers (roce.zig).
+//! A tensor-parallel group over NCCL (NCCL_COMM_ID; rows in rank order); two ranks add RoCE small gathers (roce.zig),
+//! and three ranks cabled in a triangle add them with TF_ROCE_TRIANGLE=1 (one RoCE pair a neighbour).
 const std = @import("std");
 const nccl = @import("nccl.zig");
 const driver = @import("driver.zig");
@@ -54,6 +55,12 @@ pub const Group = struct {
     glm_roce: bool = false, // TF_GLM53_COLLECTIVE agreed by both ranks during openRoce
     gather_roce: bool = false, // TF_ROCE agreed by both ranks; independent of GLM reductions
     routes: [3]u64 = @splat(0),
+    tri: [2]?*roce.Gather = .{ null, null }, // three ranks: one pair a neighbour, lower rank first (openRoce)
+
+    /// Whether gathers may take RoCE (two ranks' pair, or a triangle's two): RoCE poison checks and gates apply.
+    pub fn hasRoce(g: *const Group) bool {
+        return g.fast != null or g.tri[0] != null;
+    }
 
     /// Rank `rank` of `world` (NCCL opened at run time; NCCL_COMM_ID names rank 0's address, every rank the same).
     pub fn open(rank: usize, world: usize) !Group {
@@ -69,6 +76,7 @@ pub const Group = struct {
 
     pub fn close(g: *Group) void {
         if (g.fast) |f| f.deinit();
+        for (g.tri) |t| if (t) |f| f.deinit();
         g.destroyComm();
         g.lib.close();
         g.* = undefined;
@@ -80,14 +88,16 @@ pub const Group = struct {
 
     pub fn abort(g: *Group) void {
         if (g.fast) |f| f.abort();
+        for (g.tri) |t| if (t) |f| f.abort();
         if (!g.aborted.swap(true, .acq_rel)) _ = g.lib.api.ncclCommAbort(g.comm);
     }
 
     /// Two ranks: gathers up to `max_bytes` a rank go by RoCE writes if both ranks bring it up; else NCCL keeps them.
     pub fn openRoce(g: *Group, gpa: std.mem.Allocator, io: std.Io, d: *const driver.Driver, s: Stream, max_bytes: usize, force_gather: bool) !void {
-        if (g.fast != null) return error.AlreadyOpen;
+        if (g.hasRoce()) return error.AlreadyOpen;
         const local_glm = try wantedGlmCollective();
         const local_gather = roce.wanted() or force_gather;
+        if (g.world == 3) return g.openTriangle(gpa, io, d, s, max_bytes, local_glm, local_gather);
         if (g.world != 2) {
             if (local_glm) return error.RoceRequiresTwoRanks;
             return;
@@ -125,6 +135,95 @@ pub const Group = struct {
             }
         }
         if (g.glm_roce) try g.probeRoce(s, d);
+    }
+
+    /// TF_ROCE_TRIANGLE=1 (TF_ROCE not 0) on all three ranks: setup handshakes agree the switch and wait, then
+    /// roce.Gather.initTriangle brings up a pair a neighbour, and a probe against ncclAllGather must match on every
+    /// rank. Any rank failing setup, alignment or the probe keeps all three ranks' gathers on NCCL.
+    fn openTriangle(g: *Group, gpa: std.mem.Allocator, io: std.Io, d: *const driver.Driver, s: Stream, max_bytes: usize, local_glm: bool, local_gather: bool) !void {
+        if (local_glm) return error.RoceRequiresTwoRanks;
+        const timeout_ms = roce.timeoutMs(std.c.getenv("TF_ROCE_TIMEOUT_MS"), false) catch |err| {
+            std.log.err("Invalid RoCE timeout setting on rank {d}: TF_ROCE_TIMEOUT_MS", .{g.rank});
+            return err;
+        };
+        const Config = extern struct { tri: u32, timeout_ms: u32 };
+        var all: [3]Config = undefined;
+        try g.gather(Config, d, s, .{ .tri = @intFromBool(local_gather and wantedTriangle()), .timeout_ms = timeout_ms }, &all);
+        for (all) |c| if (c.tri != all[0].tri or c.timeout_ms != all[0].timeout_ms) {
+            std.log.err("RoCE triangle settings disagree (TF_ROCE, TF_ROCE_TRIANGLE, TF_ROCE_TIMEOUT_MS): rank0 {d}/{d}, rank1 {d}/{d}, rank2 {d}/{d}", .{ all[0].tri, all[0].timeout_ms, all[1].tri, all[1].timeout_ms, all[2].tri, all[2].timeout_ms });
+            return error.PeerRefused;
+        };
+        if (all[0].tri == 0) return;
+        const pairs = try roce.Gather.initTriangle(gpa, io, d, g, s, max_bytes, timeout_ms);
+        const a = pairs[0] orelse return; // initTriangle keeps both pairs on every rank or none anywhere
+        const b = pairs[1].?;
+        var keep = false;
+        defer if (!keep) {
+            a.deinit();
+            b.deinit();
+        };
+        // g.tri stays empty until every rank agrees, so these handshakes' poison checks never see the probe's pairs
+        var flags: [3]u32 = undefined;
+        try g.gather(u32, d, s, @intFromBool(a.buffersAligned16() and b.buffersAligned16()), &flags);
+        if (flags[0] == 0 or flags[1] == 0 or flags[2] == 0) {
+            std.log.warn("RoCE triangle: device buffers not 16-byte aligned on every rank ({d}/{d}/{d}); gathers stay on NCCL", .{ flags[0], flags[1], flags[2] });
+            return;
+        }
+        // a hard error (allocation, launch, NCCL) ends startup, as it would anywhere else in setup; a mismatch or a
+        // timed-out pair is a soft failure every rank reports below
+        const probed = try probeTriangle(g, gpa, a, b, s, d, timeout_ms);
+        try g.gather(u32, d, s, @intFromBool(probed), &flags);
+        if (flags[0] == 0 or flags[1] == 0 or flags[2] == 0) {
+            std.log.warn("RoCE triangle probe against NCCL failed (rank0 {d}, rank1 {d}, rank2 {d}); gathers stay on NCCL", .{ flags[0], flags[1], flags[2] });
+            return;
+        }
+        keep = true;
+        g.tri = .{ a, b };
+        g.gather_roce = true;
+        std.log.info("RoCE triangle gathers: rank {d} pairs with ranks {d} and {d}, shards up to {d} KiB, probe matched NCCL", .{ g.rank, a.peer_slot, b.peer_slot, a.max_bytes >> 10 });
+    }
+
+    /// Triangle gathers of several sizes (every grid class, both slots) against ncclAllGather of the same bytes. The
+    /// GPU wait is cut to 10 s meanwhile, so a pair that never connects fails here instead of hanging a request.
+    fn probeTriangle(g: *Group, gpa: std.mem.Allocator, a: *roce.Gather, b: *roce.Gather, s: Stream, d: *const driver.Driver, timeout_ms: u32) !bool {
+        a.setTimeoutMs(10_000);
+        b.setTimeoutMs(10_000);
+        defer {
+            a.setTimeoutMs(timeout_ms);
+            b.setTimeoutMs(timeout_ms);
+        }
+        const sizes = [_]usize{ 16, 4096, 24 << 10, 64 << 10, 192 << 10, 1 << 20 };
+        const most = @min(sizes[sizes.len - 1], a.max_bytes);
+        var buf = try memory.DeviceBuffer.alloc(d, 7 * most);
+        defer buf.free();
+        const mine = try gpa.alloc(u8, most);
+        defer gpa.free(mine);
+        const got = try gpa.alloc(u8, 6 * most);
+        defer gpa.free(got);
+        // Every rank runs every round whatever it saw, so the three keep issuing the same NCCL calls; a poisoned pair
+        // returns at once from later launches and its neighbours stop waiting at their own deadline.
+        var ok = true;
+        for (0..3) |round| for (sizes) |bytes| {
+            if (bytes > most) continue;
+            for (mine[0..bytes], 0..) |*x, i| x.* = @intCast((i * 7 + g.rank * 13 + round * 5 + bytes) % 251);
+            try buf.uploadAsync(0, mine[0..bytes], s.handle);
+            try roce.Gather.triGather(a, b, s.handle, buf.ptr, buf.ptr + most, bytes);
+            try g.lib.check(g.lib.api.ncclAllGather(buf.ptr, buf.ptr + 4 * most, bytes, .u8, g.comm, s.handle), "ncclAllGather(RoCE triangle probe)");
+            try s.synchronize();
+            if (!ok or a.failedQuietly() or b.failedQuietly()) {
+                ok = false;
+                continue;
+            }
+            try buf.download(most, got[0 .. 6 * most]);
+            if (!std.mem.eql(u8, got[0 .. 3 * bytes], got[3 * most ..][0 .. 3 * bytes])) ok = false;
+        };
+        return ok;
+    }
+
+    /// TF_ROCE_TRIANGLE=1 asks three cabled ranks for RoCE gathers (every rank must ask; TF_ROCE=0 still wins).
+    pub fn wantedTriangle() bool {
+        const v = std.c.getenv("TF_ROCE_TRIANGLE") orelse return false;
+        return std.mem.eql(u8, std.mem.span(v), "1");
     }
 
     fn probeRoce(g: *Group, s: Stream, d: *const driver.Driver) !void {
@@ -178,6 +277,7 @@ pub const Group = struct {
     /// A failed RoCE gather's error (its rows hold nothing valid): call it after a synchronize that reads a gather.
     pub fn check(g: *const Group) !void {
         if (g.fast) |f| try f.check();
+        for (g.tri) |t| if (t) |f| try f.check();
     }
 
     /// A step result is valid only after this synchronized poison check.
@@ -191,6 +291,7 @@ pub const Group = struct {
 
     /// Enqueue at the end of a step graph so poisoned RoCE gathers or reductions cannot return a token id.
     pub fn gateResult(g: *const Group, s: Stream, token: u64, status: u64) !void {
+        if (g.tri[0]) |a| return roce.Gather.triGateResult(a, g.tri[1].?, s.handle, token, status);
         if (gateEnabled(g.fast != null)) {
             const f = g.fast orelse return error.RoceUnavailable;
             try f.gateResult(s.handle, token, status);
@@ -199,6 +300,16 @@ pub const Group = struct {
 
     /// `bytes` at `mine` from every rank into `all` in rank order (world * bytes there), on `s`.
     pub fn allGather(g: *const Group, s: Stream, mine: u64, all: u64, bytes: usize) !void {
+        if (g.tri[0]) |a| {
+            const b = g.tri[1].?;
+            const route = gatherRoute(g.gather_roce, true, a.fits(bytes) and b.fits(bytes), a.boundTo(s.handle) and b.boundTo(s.handle));
+            @constCast(g).routes[@intFromEnum(route)] += 1;
+            if (route == .roce) {
+                if (!roce.aligned16(mine) or !roce.aligned16(all)) return error.RoceAlignmentViolation;
+                return roce.Gather.triGather(a, b, s.handle, mine, all, bytes);
+            }
+            return g.lib.check(g.lib.api.ncclAllGather(mine, all, bytes, .u8, g.comm, s.handle), "ncclAllGather");
+        }
         const f = g.fast;
         const route = gatherRoute(g.gather_roce, f != null, if (f) |fast| fast.fits(bytes) else false, if (f) |fast| fast.boundTo(s.handle) else false);
         @constCast(g).routes[@intFromEnum(route)] += 1;

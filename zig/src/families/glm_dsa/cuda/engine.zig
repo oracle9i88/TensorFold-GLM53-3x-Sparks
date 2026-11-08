@@ -495,10 +495,10 @@ pub const Engine = struct {
             e.head_host = &.{};
             e.head_host = try e.gpa.alloc(u8, n);
         }
-        if (e.download.group) |group| if (group.fast != null) try group.syncChecked(stream);
+        if (e.download.group) |group| if (group.hasRoce()) try group.syncChecked(stream);
         try e.download.download_fn(e.download.ctx, stream, gathered, e.head_host[0..n]);
         if (e.download.group) |group| {
-            if (group.fast != null) {
+            if (group.hasRoce()) {
                 var status: [4]u8 = undefined;
                 try e.download.download_fn(e.download.ctx, stream, e.f.st.ws.roce_status, &status);
                 e.head_status = std.mem.readInt(u32, &status, .little);

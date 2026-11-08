@@ -312,6 +312,10 @@ pub const Gather = struct {
     err: [256]u8 = @splat(0),
     gathers: u64 = 0,
     stream_handle: ?abi.Stream = null,
+    /// A TP=3 triangle pair's neighbour: where its shard lands in roce_gather_tri's output (unused by two ranks).
+    peer_slot: u8 = 0,
+    f_tri: Function = undefined, // roce_gather_tri and its status gate (triangle pairs only)
+    gate_tri: Function = undefined,
 
     /// Both ranks' exchange or null on both; setup crosses ``group``'s communicator on ``s``. ``max_bytes``: a shard.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const Driver, group: *const tp_group.Group, s: Stream, want: bool, max_bytes: usize, timeout_ms: u32) !?*Gather {
@@ -360,11 +364,156 @@ pub const Gather = struct {
         return g;
     }
 
+    /// TP=3 over a cabled triangle (TF_ROCE_TRIANGLE=1): one two-rank Gather a neighbour, each on the HCAs of the port
+    /// cabled to it. TF_ROCE_HCA (else NCCL_IB_HCA) names port 0's and port 1's HCAs, told apart by their f0/f1
+    /// suffix; port 0 faces rank + 1 and port 1 rank + 2, or the reverse with TF_ROCE_TRIANGLE_F0=prev. Every rank
+    /// sets both up, swaps blobs over the group's NCCL, connects, and keeps them only when all three ranks connected
+    /// both; otherwise all three return none and stay on NCCL. [0] is the lower-ranked neighbour. A gather runs both
+    /// pairs in one launch (triGather): run one after the other they would chain across the ranks ({0,1}, then
+    /// {0,2}, then {1,2}) and cost three exchanges.
+    pub fn initTriangle(gpa: std.mem.Allocator, io: std.Io, d: *const Driver, group: *const tp_group.Group, s: Stream, max_bytes: usize, timeout_ms: u32) ![2]?*Gather {
+        if (group.world != 3) return error.PeerRefused;
+        const rank: u8 = @intCast(group.rank);
+        const f0_prev = if (std.c.getenv("TF_ROCE_TRIANGLE_F0")) |v| std.mem.eql(u8, std.mem.span(v), "prev") else false;
+        const peers = triPeers(rank);
+        var gs: [2]?*Gather = .{ null, null };
+        errdefer for (gs) |maybe| if (maybe) |g| g.deinit();
+        var mine: Tri = std.mem.zeroes(Tri);
+        for (peers, 0..) |peer, i| {
+            const port = triPort(rank, peer, f0_prev);
+            var names: [max_hcas][64]u8 = undefined;
+            var lens: [max_hcas]usize = undefined;
+            const n = portHcaNames(port, &names, &lens);
+            if (n == 0) std.log.warn("RoCE triangle: TF_ROCE_HCA/NCCL_IB_HCA names no HCA ending f{c} (toward rank {d})", .{ port, peer });
+            const g = try gpa.create(Gather);
+            const ok = n > 0 and blk: {
+                g.setupNamed(gpa, io, d, rank, max_bytes, &names, &lens, n) catch |e| {
+                    std.log.warn("RoCE triangle: HCAs on port {c} toward rank {d} unavailable: {s} ({s})", .{ port, peer, @errorName(e), std.mem.sliceTo(&g.err, 0) });
+                    break :blk false;
+                };
+                g.f_tri = g.module.function("roce_gather_tri") catch |e| {
+                    std.log.warn("RoCE triangle: kernel roce_gather_tri missing: {s}", .{@errorName(e)});
+                    g.teardown();
+                    break :blk false;
+                };
+                g.gate_tri = g.module.function("roce_status_gate_tri") catch |e| {
+                    std.log.warn("RoCE triangle: kernel roce_status_gate_tri missing: {s}", .{@errorName(e)});
+                    g.teardown();
+                    break :blk false;
+                };
+                break :blk true;
+            };
+            if (!ok) {
+                gpa.destroy(g);
+                continue;
+            }
+            gs[i] = g;
+            g.blob(&mine.to[peer]);
+        }
+        var all: [3]Tri = undefined;
+        try group.gather(Tri, d, s, mine, &all);
+        var connected = Flags{};
+        for (peers, 0..) |peer, i| {
+            const g = gs[i] orelse continue;
+            const theirs = all[peer].to[rank];
+            if (theirs.ok == 0 or theirs.n_hca != g.n_hca or theirs.slot_bytes != g.layout.slot_bytes) continue;
+            g.max_bytes = agreedCap(g.max_bytes, theirs.max_bytes);
+            g.timeout_ns = @as(u64, timeout_ms) * std.time.ns_per_ms;
+            g.connect(&theirs) catch |e| {
+                std.log.warn("RoCE triangle: connecting rank {d} to rank {d} failed: {s} ({s})", .{ rank, peer, @errorName(e), std.mem.sliceTo(&g.err, 0) });
+                continue;
+            };
+            g.stream_handle = s.handle;
+            g.peer_slot = peer;
+            connected.ok[i] = 1;
+        }
+        var every: [3]Flags = undefined;
+        try group.gather(Flags, d, s, connected, &every);
+        for (every) |f| if (f.ok[0] == 0 or f.ok[1] == 0) {
+            for (&gs) |*maybe| if (maybe.*) |g| {
+                g.deinit();
+                maybe.* = null;
+            };
+            std.log.warn("RoCE triangle: not every rank connected both neighbours; gathers stay on NCCL", .{});
+            return gs;
+        };
+        // One cap for all three pairs, so a gather of any size takes the same path on every rank.
+        var caps: [3]Caps = undefined;
+        try group.gather(Caps, d, s, .{ .bytes = @min(gs[0].?.max_bytes, gs[1].?.max_bytes) }, &caps);
+        var cap: u64 = caps[0].bytes;
+        for (caps) |c| cap = @min(cap, c.bytes);
+        for (gs) |maybe| maybe.?.max_bytes = @intCast(cap);
+        std.log.info("RoCE triangle all-gather: rank {d} to {d} and {d}, {d}+{d} HCA(s), shards up to {d} KiB by RDMA writes", .{ rank, peers[0], peers[1], gs[0].?.n_hca, gs[1].?.n_hca, cap >> 10 });
+        return gs;
+    }
+
+    const Tri = extern struct { to: [3]Blob };
+    const Flags = extern struct { ok: [2]u32 = .{ 0, 0 } };
+    const Caps = extern struct { bytes: u64 };
+
+    /// roce_gather_tri's RocePair: one pair's region, counters and neighbour.
+    pub const Pair = extern struct { recv: u64, flags: u64, send: u64, ctrl: u64, counters: u64, slot_bytes: i64, peer_slot: i32, n_hca: i32 };
+
+    fn pair(g: *const Gather) Pair {
+        const base = g.region_dev;
+        return .{ .recv = base + g.layout.recv, .flags = base + g.layout.flags, .send = base + g.layout.send, .ctrl = base + g.layout.ctrl, .counters = g.counters.ptr, .slot_bytes = @intCast(g.layout.slot_bytes), .peer_slot = g.peer_slot, .n_hca = @intCast(g.n_hca) };
+    }
+
+    /// Three ranks' ``bytes`` from ``send`` into ``recv`` in rank order (as ncclAllGather), over both of a triangle's
+    /// pairs (initTriangle's [0] and [1]) in one launch.
+    pub fn triGather(a: *Gather, b: *Gather, stream: abi.Stream, send: abi.DevicePtr, recv: abi.DevicePtr, bytes: usize) !void {
+        if (!a.boundTo(stream) or !b.boundTo(stream)) return error.StreamMismatch;
+        if (!aligned16(send) or !aligned16(recv)) return error.Misaligned;
+        const packs = bytes / 16;
+        const need = @max(1, std.math.divCeil(usize, packs, 2 * threads) catch unreachable);
+        const grid: u32 = @intCast(@min(std.math.ceilPowerOfTwo(usize, need) catch max_blocks, max_blocks));
+        const klass: i32 = @intCast(std.math.log2_int(u32, grid));
+        var args: launch.Args = .{};
+        args.add(send);
+        args.add(recv);
+        args.add(@as(i32, @intCast(packs)));
+        args.add(@as(i32, a.rank));
+        args.add(a.pair());
+        args.add(b.pair());
+        args.add(klass);
+        args.add(@min(a.timeout_ns, b.timeout_ns));
+        try launch.launch(a.f_tri, .{ .grid = .{ .x = grid }, .block = .{ .x = threads } }, .{ .handle = stream, .d = a.d }, &args);
+        a.gathers += 1;
+        b.gathers += 1;
+    }
+
+    /// gateResult over both of a triangle's pairs.
+    pub fn triGateResult(a: *Gather, b: *Gather, stream: abi.Stream, token: abi.DevicePtr, status: abi.DevicePtr) !void {
+        var args: launch.Args = .{};
+        args.add(a.region_dev + a.layout.ctrl);
+        args.add(b.region_dev + b.layout.ctrl);
+        args.add(token);
+        args.add(status);
+        try launch.launch(a.gate_tri, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1 } }, .{ .handle = stream, .d = a.d }, &args);
+    }
+
+    /// Whether a gather already waited past its deadline or its proxy failed, without logging (triangle probe).
+    pub fn failedQuietly(g: *Gather) bool {
+        return @atomicLoad(u32, &g.ctrl()[c_error], .acquire) != 0 or g.failed.load(.acquire);
+    }
+
+    /// Override the GPU wait bound (the triangle probe shortens it, then restores the configured one).
+    pub fn setTimeoutMs(g: *Gather, timeout_ms: u32) void {
+        g.timeout_ns = @as(u64, timeout_ms) * std.time.ns_per_ms;
+    }
+
     fn fail(g: *Gather, comptime fmt: []const u8, args: anytype) void {
         _ = std.fmt.bufPrint(g.err[0 .. g.err.len - 1], fmt, args) catch {};
     }
 
     fn setup(g: *Gather, gpa: std.mem.Allocator, io: std.Io, d: *const Driver, rank: u8, max_bytes: usize) !void {
+        var names: [max_hcas][64]u8 = undefined;
+        var lens: [max_hcas]usize = undefined;
+        const n = try hcaNames(io, gpa, &names, &lens);
+        try g.setupNamed(gpa, io, d, rank, max_bytes, &names, &lens, n);
+    }
+
+    fn setupNamed(g: *Gather, gpa: std.mem.Allocator, io: std.Io, d: *const Driver, rank: u8, max_bytes: usize, names: *const [max_hcas][64]u8, lens: *const [max_hcas]usize, n_hca: u32) !void {
         g.* = .{ .gpa = gpa, .d = d, .lib = undefined, .api = undefined, .rank = rank, .layout = .of(max_bytes), .region = undefined, .region_dev = 0, .counters = undefined, .module = undefined, .f = undefined, .reduce_f32 = undefined, .reduce_bf16 = undefined, .status_gate = undefined, .reduce_scratch = undefined, .max_bytes = max_bytes, .timeout_ns = 0 };
         g.lib = std.DynLib.open("libibverbs.so.1") catch return @import("sys").optional_libraries.unavailable(.verbs);
         errdefer g.lib.close();
@@ -372,9 +521,7 @@ pub const Gather = struct {
         inline for (info.field_names, info.field_types) |name, T| {
             @field(g.api, name) = g.lib.lookup(T, name) orelse return @import("sys").optional_libraries.unavailable(.verbs);
         }
-        var names: [max_hcas][64]u8 = undefined;
-        var lens: [max_hcas]usize = undefined;
-        g.n_hca = try hcaNames(io, gpa, &names, &lens);
+        g.n_hca = n_hca;
         g.region = try memory.HostBuffer.allocMapped(d, g.layout.total);
         errdefer g.region.free();
         @memset(g.region.bytes, 0);
@@ -730,6 +877,47 @@ fn hcaNames(io: std.Io, gpa: std.mem.Allocator, names: *[max_hcas][64]u8, lens: 
     return n;
 }
 
+/// A triangle rank's two neighbours, lower rank first (initTriangle's [0] and [1]).
+pub fn triPeers(rank: u8) [2]u8 {
+    const next: u8 = (rank + 1) % 3;
+    const prev: u8 = (rank + 2) % 3;
+    return .{ @min(next, prev), @max(next, prev) };
+}
+
+/// The port ('0' or '1', the HCA names' f0/f1 suffix) cabled from `rank` to `peer`: port 0 faces rank + 1 and
+/// port 1 rank + 2 (rank 0 f0 to rank 1 f1, rank 1 f0 to rank 2 f1, rank 2 f0 to rank 0 f1), or the reverse with `f0_prev`.
+pub fn triPort(rank: u8, peer: u8, f0_prev: bool) u8 {
+    return if ((peer == (rank + 1) % 3) != f0_prev) '0' else '1';
+}
+
+/// The HCAs of one port from TF_ROCE_HCA, else NCCL_IB_HCA (see portNames).
+fn portHcaNames(port: u8, names: *[max_hcas][64]u8, lens: *[max_hcas]usize) u32 {
+    const raw = std.c.getenv("TF_ROCE_HCA") orelse std.c.getenv("NCCL_IB_HCA") orelse return 0;
+    return portNames(std.mem.span(raw), port, names, lens);
+}
+
+/// The names in an HCA list that end f`port` (without "=^" prefixes or ":port" suffixes), at most two, sorted: on a
+/// Spark, rocep1s0fN and roceP2p1s0fN are port N's two PCIe functions, and each sits on its own /30 with the same
+/// function of the neighbour's port, so both ends of a cable must stripe over them in the same order.
+pub fn portNames(list: []const u8, port: u8, names: *[max_hcas][64]u8, lens: *[max_hcas]usize) u32 {
+    var n: u32 = 0;
+    var it = std.mem.tokenizeScalar(u8, list, ',');
+    while (it.next()) |w| {
+        if (n == max_hcas) break;
+        var s = std.mem.trimStart(u8, std.mem.trim(u8, w, " "), "=^");
+        if (std.mem.indexOfScalar(u8, s, ':')) |c| s = s[0..c];
+        if (s.len < 2 or s.len > 63 or s[s.len - 2] != 'f' or s[s.len - 1] != port) continue;
+        @memcpy(names[n][0..s.len], s);
+        lens[n] = s.len;
+        n += 1;
+    }
+    if (n == 2 and std.mem.order(u8, names[1][0..lens[1]], names[0][0..lens[0]]) == .lt) {
+        std.mem.swap([64]u8, &names[0], &names[1]);
+        std.mem.swap(usize, &lens[0], &lens[1]);
+    }
+    return n;
+}
+
 /// The HCA's RoCE v2 IPv4 GID (TF_ROCE_GID_INDEX overrides): its index differs between hosts' tables.
 fn gidIndex(io: std.Io, gpa: std.mem.Allocator, name: []const u8) !c_int {
     if (std.c.getenv("TF_ROCE_GID_INDEX")) |v| return std.fmt.parseInt(c_int, std.mem.span(v), 10) catch error.NoHca;
@@ -823,6 +1011,34 @@ test "RoCE all-reduce dispatch is symmetric and respects dtype, op, size, and op
     try std.testing.expect(!Gather.dispatchRoce(true, 2, 0, true, max_bytes, max_bytes));
     try std.testing.expect(!Gather.dispatchRoce(true, 2, 1, true, 3, max_bytes));
     for (1..9) |rows| try std.testing.expect(Gather.dispatchRoce(true, 2, 0, true, rows * 6144, max_bytes));
+}
+
+test "RoCE triangle: pairs, ports and HCA order agree at both ends of every cable" {
+    for (0..3) |r| {
+        const rank: u8 = @intCast(r);
+        const peers = triPeers(rank);
+        try std.testing.expect(peers[0] < peers[1] and peers[0] != rank and peers[1] != rank);
+        for (peers) |peer| for ([_]bool{ false, true }) |f0_prev| {
+            // the cable's two ends use opposite ports, so each port faces exactly one neighbour
+            try std.testing.expect(triPort(rank, peer, f0_prev) != triPort(peer, rank, f0_prev));
+        };
+    }
+    // the cluster's cabling: rank 0 f0 to rank 1, rank 1 f0 to rank 2, rank 2 f0 to rank 0
+    try std.testing.expectEqual(@as(u8, '0'), triPort(0, 1, false));
+    try std.testing.expectEqual(@as(u8, '1'), triPort(1, 0, false));
+    try std.testing.expectEqual(@as(u8, '0'), triPort(2, 0, false));
+    var names: [max_hcas][64]u8 = undefined;
+    var lens: [max_hcas]usize = undefined;
+    const list = "rocep1s0f0,roceP2p1s0f0, =rocep1s0f1:1,roceP2p1s0f1";
+    try std.testing.expectEqual(@as(u32, 2), portNames(list, '0', &names, &lens));
+    try std.testing.expectEqualStrings("roceP2p1s0f0", names[0][0..lens[0]]);
+    try std.testing.expectEqualStrings("rocep1s0f0", names[1][0..lens[1]]);
+    try std.testing.expectEqual(@as(u32, 2), portNames(list, '1', &names, &lens));
+    try std.testing.expectEqualStrings("roceP2p1s0f1", names[0][0..lens[0]]);
+    try std.testing.expectEqualStrings("rocep1s0f1", names[1][0..lens[1]]);
+    try std.testing.expectEqual(@as(u32, 0), portNames("mlx5_0,mlx5_1", '0', &names, &lens));
+    try std.testing.expectEqual(@as(usize, 56), @sizeOf(Gather.Pair));
+    try std.testing.expectEqual(@as(usize, 48), @offsetOf(Gather.Pair, "peer_slot"));
 }
 
 test "RoCE stream identity is explicit" {

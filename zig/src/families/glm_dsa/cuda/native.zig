@@ -595,7 +595,7 @@ const Owned = struct {
         if (own.alive_side_stream) if (own.side_stream) |*s| s.deinit();
         if (own.alive_stream) own.stream.deinit();
         if (own.alive_group) {
-            if (own.group.fast != null) {
+            if (own.group.hasRoce()) {
                 const counts = own.group.routeCounts();
                 std.log.info("RoCE routes: roce {d}, nccl (size) {d}, nccl (other stream) {d}", .{ counts[0], counts[1], counts[2] });
             }
@@ -1168,7 +1168,7 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
     own.stream = try cuda.Stream.init(ctx.d, false);
     own.alive_stream = true;
     try own.group.openRoce(gpa, io, ctx.d, own.stream, 4 << 20, geometry.coll_fuse);
-    if (own.group.fast != null) std.log.info("RoCE gathers bound to the main stream; other streams and setup handshakes use NCCL", .{});
+    if (own.group.hasRoce()) std.log.info("RoCE gathers bound to the main stream; other streams and setup handshakes use NCCL", .{});
     step.mark(gpa, io, "stream + RoCE shards");
     tracer.step("RoCE shards", .nccl, 4 << 20);
     const local_switches = PrefillCommSwitches{ .prefetch = @intFromBool(geometry.prefetch), .tbo = @intFromBool(geometry.tbo), .coll_fuse = @intFromBool(geometry.coll_fuse), .index_pipe = @intFromBool(geometry.index_pipe), .attn_pipe = @intFromBool(attn_pipe) };
@@ -1323,7 +1323,7 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
     vmm_owned = false; // initWith takes ownership on both success and failure
     own.st = try state.State.initWith(ctx.d, ctx.device, state_vmm, geometry, o.context, p.rank, p.world, &admission, after.available);
     own.alive_state = true;
-    if (own.group.fast != null) if (own.st.adapt) |ad| {
+    if (own.group.hasRoce()) if (own.st.adapt) |ad| {
         if (!state.adaptRoceAligned(ad.ws)) return error.ExpertRowsAdaptRoceMisaligned;
         std.log.info("glm53 expert rows adapt with RoCE: adapt workspace 16-byte aligned (RoCE registers only its pinned region)", .{});
     };
@@ -1346,7 +1346,7 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
             std.log.info("glm53 graph budget: 0 MiB, every decode step eager", .{});
         }
     }
-    if (own.group.fast != null) own.engine.download.group = &own.group;
+    if (own.group.hasRoce()) own.engine.download.group = &own.group;
     try own.engine.f.validateSetup();
     own.engine.mem.floor = try state.floorFromEnv();
     if (prefix_cache_enabled) {

@@ -168,3 +168,135 @@ extern "C" __global__ void roce_status_gate(const uint32_t* ctrl, uint32_t* toke
         if (poisoned) *token = 0xffffffffu;
     }
 }
+
+// -- TP=3 over a cabled triangle -------------------------------------------------------------------------------------
+// Each rank keeps two of roce_gather's two-rank exchanges, one with each neighbour, each with its own region,
+// counters and host proxy (roce.zig initTriangle). One launch runs both: it stages the shard into both send slots,
+// rings both doorbells, waits for both neighbours' flags, then writes all three shards in rank order. Two roce_gather
+// launches in a row would chain the pairs ({0,1}, then {0,2}, then {1,2}) and cost three exchanges, not one.
+struct RocePair {
+    char* recv;
+    char* flags;
+    char* send;
+    uint32_t* ctrl;
+    uint32_t* counters;
+    long long slot_bytes;
+    int peer_slot;  // the neighbour's rank: where its shard lands in `out`
+    int n_hca;
+};
+
+namespace {
+
+__device__ __forceinline__ uint32_t pair_poisoned(const RocePair& p) {
+    return ld_relaxed_gpu(p.counters + K_POISON) | ld_relaxed_sys(p.ctrl + C_ABORT);
+}
+
+__device__ __forceinline__ void pair_fail(const RocePair& p, int h, uint32_t seq, uint32_t kind) {
+    st_relaxed_sys(p.ctrl + C_HCA, (uint32_t)h);
+    st_relaxed_sys(p.ctrl + C_ERROR_SEQ, seq);
+    st_relaxed_sys(p.ctrl + C_ERROR_KIND, kind);
+    st_relaxed_sys(p.ctrl + C_ERROR, 1u);
+    st_release_gpu(p.counters + K_POISON, 1u);
+}
+
+// roce_gather's step 3 for one HCA stripe of pair `p`.
+__device__ __forceinline__ void pair_wait(const RocePair& p, uint32_t slot, uint32_t seq, int h, int packs, uint64_t timeout_ns) {
+    const uint32_t* flag = reinterpret_cast<const uint32_t*>(p.flags + ((long long)slot * p.n_hca + h) * FLAG_STRIDE);
+    const uint64_t deadline = globaltimer() + timeout_ns;
+    while (true) {
+        if (ld_acquire_sys(flag) == seq) {
+            if (ld_relaxed_sys(flag + 1) != (uint32_t)packs * 16u) pair_fail(p, h, seq, 2u);
+            return;
+        }
+        if (ld_relaxed_sys(p.ctrl + C_ABORT) != 0u || globaltimer() >= deadline) {
+            pair_fail(p, h, seq, 1u);
+            return;
+        }
+    }
+}
+
+}  // namespace
+
+// in: this rank's shard (packs of 16 bytes); out: three shards in rank order. Pair a's arrival counters order both
+// pairs' doorbells and epochs (each launch adds a whole grid to one class, as roce_gather does).
+extern "C" __global__ void __launch_bounds__(512) roce_gather_tri(
+    const uint4* __restrict__ in, uint4* __restrict__ out, int packs, int rank, RocePair a, RocePair b, int klass,
+    uint64_t timeout_ns) {
+    const int tid = threadIdx.x;
+    uint32_t* stage = a.counters + 2 + klass;
+    uint32_t* tail = a.counters + 2 + K_CLASSES + klass;
+    const int at = blockIdx.x * blockDim.x + tid, stride = gridDim.x * blockDim.x;
+    __shared__ uint32_t poisoned;
+    if (tid == 0) poisoned = pair_poisoned(a) | pair_poisoned(b);
+    __syncthreads();
+    if (poisoned != 0u) {
+        const uint4 nan4 = make_uint4(0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu);
+        for (int i = at; i < packs; i += stride) {
+            out[(long long)rank * packs + i] = nan4;
+            out[(long long)a.peer_slot * packs + i] = nan4;
+            out[(long long)b.peer_slot * packs + i] = nan4;
+        }
+        return;
+    }
+    const uint32_t seq_a = ld_relaxed_gpu(a.counters + K_EPOCH) + 1u, slot_a = seq_a & 1u;
+    const uint32_t seq_b = ld_relaxed_gpu(b.counters + K_EPOCH) + 1u, slot_b = seq_b & 1u;
+
+    uint4* mine_a = reinterpret_cast<uint4*>(a.send + (long long)slot_a * a.slot_bytes);  // 1. stage, both pairs
+    uint4* mine_b = reinterpret_cast<uint4*>(b.send + (long long)slot_b * b.slot_bytes);
+    for (int i = at; i < packs; i += stride) {
+        const uint4 v = in[i];
+        mine_a[i] = v;
+        mine_b[i] = v;
+    }
+    __syncthreads();
+    if (tid == 0) {  // 2. both doorbells, by the last block to stage
+        fence_sys();
+        if ((arrive(stage) + 1u) % gridDim.x == 0u) {
+            st_relaxed_sys(a.ctrl + C_NBYTES + slot_a, (uint32_t)packs * 16u);
+            st_relaxed_sys(b.ctrl + C_NBYTES + slot_b, (uint32_t)packs * 16u);
+            fence_sys();
+            st_relaxed_sys(a.ctrl + C_SEQ, seq_a);
+            st_relaxed_sys(b.ctrl + C_SEQ, seq_b);
+        }
+    }
+    // 3. both neighbours' stripes, each pair's waiters in a warp of their own
+    if (tid < a.n_hca) pair_wait(a, slot_a, seq_a, tid, packs, timeout_ns);
+    else if (tid >= 32 && tid < 32 + b.n_hca) pair_wait(b, slot_b, seq_b, tid - 32, packs, timeout_ns);
+    __syncthreads();
+    if (tid == 0) poisoned = pair_poisoned(a) | pair_poisoned(b);
+    __syncthreads();
+    if (poisoned == 0u) {  // 4. three shards in rank order
+        const uint4* theirs_a = reinterpret_cast<const uint4*>(a.recv + (long long)slot_a * a.slot_bytes);
+        const uint4* theirs_b = reinterpret_cast<const uint4*>(b.recv + (long long)slot_b * b.slot_bytes);
+        uint4* own_out = out + (long long)rank * packs;
+        uint4* a_out = out + (long long)a.peer_slot * packs;
+        uint4* b_out = out + (long long)b.peer_slot * packs;
+        for (int i = at; i < packs; i += stride) {
+            own_out[i] = in[i];
+            a_out[i] = ld_relaxed_sys4(theirs_a + i);
+            b_out[i] = ld_relaxed_sys4(theirs_b + i);
+        }
+    }
+    fence_gpu();  // 5. both epochs, by the last block to finish
+    __syncthreads();
+    if (tid == 0 && (arrive(tail) + 1u) % gridDim.x == 0u) {
+        fence_gpu();
+        const uint32_t bad = ld_relaxed_sys(a.ctrl + C_ERROR) | ld_relaxed_sys(a.ctrl + C_ABORT) |
+                             ld_relaxed_sys(b.ctrl + C_ERROR) | ld_relaxed_sys(b.ctrl + C_ABORT);
+        if (bad == 0u) {
+            st_release_gpu(a.counters + K_EPOCH, seq_a);
+            st_release_gpu(b.counters + K_EPOCH, seq_b);
+        }
+    }
+}
+
+// roce_status_gate over both pairs of a triangle (one launch, so a clean pair cannot overwrite the other's status).
+extern "C" __global__ void roce_status_gate_tri(const uint32_t* ctrl_a, const uint32_t* ctrl_b, uint32_t* token,
+                                                uint32_t* status) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        const uint32_t bad = ld_acquire_sys(ctrl_a + C_ERROR) | ld_acquire_sys(ctrl_a + C_ABORT) |
+                             ld_acquire_sys(ctrl_b + C_ERROR) | ld_acquire_sys(ctrl_b + C_ABORT);
+        *status = bad != 0u ? 1u : 0u;
+        if (bad != 0u) *token = 0xffffffffu;
+    }
+}
