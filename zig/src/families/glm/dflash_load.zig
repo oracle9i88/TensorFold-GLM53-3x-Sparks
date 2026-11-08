@@ -374,7 +374,7 @@ fn loadWithHeadChunkedShared(gpa: std.mem.Allocator, io: std.Io, e: anytype, dir
 fn loadWithHeadChunkedSharedInner(gpa: std.mem.Allocator, io: std.Io, e: anytype, dir: []const u8, rank: usize, world: usize, bits: u8, geometry: df.Geometry, draft_head: ?q4.Q4, chunk_limit: usize, share_scratch: bool) !*Drafter {
     if (bits != 0 and bits != 4) return error.BadDrafterBits;
     try checkConfig(gpa, io, dir, geometry);
-    if (world == 0 or world > 2 or rank >= world) return error.BadDrafterWorld;
+    if (world == 0 or world > 3 or rank >= world) return error.BadDrafterWorld;
     if (!geometry.flashKernelAbi() and geometry.kind != .dspark) _ = try df.kernelShape(geometry);
     if (geometry.layers == 0 or geometry.hidden == 0 or geometry.block_size == 0 or geometry.block_size > df.BLOCK or geometry.selector_rank == 0 or geometry.selector_rank > df.RANK or geometry.selector_top_k == 0 or geometry.selector_top_k > df.MAX_TOPK or geometry.head_dim != (if (geometry.kind == .dspark) 64 else df.HD) or geometry.kv_heads == 0 or (geometry.conv and (geometry.conv_group == 0 or geometry.conv_kernel == 0 or geometry.conv_kernel > 2 or geometry.hidden % geometry.conv_group != 0)) or geometry.hidden % 1024 != 0 or geometry.ff % 1024 != 0 or geometry.heads % geometry.kv_heads != 0 or geometry.heads / geometry.kv_heads > 8) return error.DrafterGeometryUnsupported;
     const D = geometry.hidden;

@@ -110,9 +110,10 @@ fn postLoadServeGate(own: anytype, io: std.Io, gpa: std.mem.Allocator, rank: usi
     var global_byte: u8 = 0;
     try flag.download(0, std.mem.asBytes(&global_byte));
     const Metrics = extern struct { available: u64, free: u64, graphs: u64 };
-    var pair_metrics: [2]Metrics = undefined;
+    var metrics_buf: [3]Metrics = undefined;
+    const pair_metrics = metrics_buf[0..own.group.world];
     const graph_count: u64 = if (own.engine.graphs) |cache| @intCast(cache.count()) else 0;
-    try own.group.gather(Metrics, own.stream.d, own.stream, .{ .available = info.available, .free = info.free, .graphs = graph_count }, &pair_metrics);
+    try own.group.gather(Metrics, own.stream.d, own.stream, .{ .available = info.available, .free = info.free, .graphs = graph_count }, pair_metrics);
     const verdict: []const u8 = if (global_byte == 0) "pass" else "refuse";
     for (pair_metrics, 0..) |m, peer_rank| {
         const peer_verdict = state.serveGate(m.available, m.free, min_avail, min_free);
@@ -351,6 +352,9 @@ pub fn admissionChoice(base: state.Geometry, requested: usize, context: usize, w
 /// the checkpoint (routed experts and backbone split by TP, embed and lm_head by vocabulary; measured 95.9 of 189.3 GiB
 /// per rank), so 51% is a conservative share. The exact per-rank plan is admitted in open() (planRank + admissionChoice).
 pub fn weightShare(_: std.mem.Allocator, _: std.Io, _: []const u8, whole: u64) u64 {
+    if (std.c.getenv("TF_GLM_WORLD")) |w| {
+        if (std.mem.eql(u8, std.mem.span(w), "3")) return whole / 100 * 36;
+    }
     return whole / 100 * 51;
 }
 
@@ -365,12 +369,12 @@ pub fn place() !Place {
         .rank = std.fmt.parseInt(usize, std.mem.span(rank_text), 10) catch return error.NoRank,
         .world = std.fmt.parseInt(usize, std.mem.span(world_text), 10) catch return error.NoRank,
     };
-    if (p.world != 2 or p.rank >= p.world) return error.UnsupportedWorld;
+    if ((p.world != 2 and p.world != 3) or p.rank >= p.world) return error.UnsupportedWorld;
     return p;
 }
 
 /// NCCL's opaque id crosses the configured leader host. Port + 1 belongs to tp_watch; this
-/// bootstrap uses port + 2 so both ranks initialize the same communicator before model loading.
+/// bootstrap uses port + 2 so all ranks initialize the same communicator before model loading.
 fn ncclId(io: std.Io, lib: *const cuda.nccl.Library, p: Place, leader: []const u8) !cuda.nccl.UniqueId {
     const text = leader;
     const colon = std.mem.lastIndexOfScalar(u8, text, ':') orelse return error.NoCommId;
@@ -392,15 +396,17 @@ fn ncclId(io: std.Io, lib: *const cuda.nccl.Library, p: Place, leader: []const u
         const one: c_int = 1;
         try posix.setsockopt(server, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one));
         if (posix.errno(posix.system.bind(server, @ptrCast(&addr), @sizeOf(posix.sockaddr.in))) != .SUCCESS or
-            posix.errno(posix.system.listen(server, 1)) != .SUCCESS) return error.NcclBootstrapFailed;
-        var fds = [_]posix.pollfd{.{ .fd = server, .events = posix.POLL.IN, .revents = 0 }};
-        if ((posix.poll(&fds, 300_000) catch 0) == 0) return error.RankNeverCame;
-        const rc = posix.system.accept(server, null, null);
-        if (posix.errno(rc) != .SUCCESS) return error.NcclBootstrapFailed;
-        const fd: posix.socket_t = @intCast(rc);
-        defer _ = posix.system.close(fd);
+            posix.errno(posix.system.listen(server, @intCast(p.world - 1))) != .SUCCESS) return error.NcclBootstrapFailed;
         try lib.check(lib.api.ncclGetUniqueId(&id), "ncclGetUniqueId");
-        try writeAll(fd, std.mem.asBytes(&id));
+        for (1..p.world) |_| {
+            var fds = [_]posix.pollfd{.{ .fd = server, .events = posix.POLL.IN, .revents = 0 }};
+            if ((posix.poll(&fds, 300_000) catch 0) == 0) return error.RankNeverCame;
+            const rc = posix.system.accept(server, null, null);
+            if (posix.errno(rc) != .SUCCESS) return error.NcclBootstrapFailed;
+            const fd: posix.socket_t = @intCast(rc);
+            defer _ = posix.system.close(fd);
+            try writeAll(fd, std.mem.asBytes(&id));
+        }
     } else {
         var tries: usize = 0;
         var fd: posix.socket_t = undefined;
@@ -939,15 +945,12 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
 
     cuda.exl3_experts.l2_depth = try l2Depth();
     const p = try place();
-    if (p.world != 2) return error.UnsupportedWorld;
+    if (p.world != 2 and p.world != 3) return error.UnsupportedWorld;
     var leader_buf: [64]u8 = undefined;
     const leader = try copyLeader(if (std.c.getenv("NCCL_COMM_ID")) |v| std.mem.span(v) else null, &leader_buf);
     const side_comms = sideCommsWanted(forward.attnPipeSwitch(), forward.prefetchSwitch());
-    std.log.info("glm53 side comms: rank {d} attn_pipe={d} prefetch={d} wanted={d} leader {s} NCCL_COMM_ID {s}", .{ p.rank, @intFromBool(forward.attnPipeSwitch()), @intFromBool(forward.prefetchSwitch()), @intFromBool(side_comms), leader, if (side_comms) "released (environ copy; start-up block kept)" else "kept" });
-    if (side_comms) {
-        try releaseCommId();
-        std.log.info("glm53 side communicators: NCCL_COMM_ID {s} kept as the rank address only; every NCCL communicator from a unique id", .{leader});
-    }
+    try releaseCommId();
+    std.log.info("glm53 side comms: rank {d} attn_pipe={d} prefetch={d} wanted={d} leader {s} NCCL_COMM_ID released", .{ p.rank, @intFromBool(forward.attnPipeSwitch()), @intFromBool(forward.prefetchSwitch()), @intFromBool(side_comms), leader });
     if (comptime builtin.os.tag == .linux) try cuda.tp_watch.startAt(io, p.rank, p.world, leader);
     errdefer cuda.tp_watch.fail("native open failed");
     var cfg = try weights.readConfig(gpa, io, dir);
@@ -956,10 +959,10 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
     defer if (mf) |*m| m.deinit();
     if (mf) |*m| try checkContext(o.context, m);
     if (cfg.mtp != 0 or cfg.configured_mtp != 0) return error.MtpUnsupported;
-    cfg.dcp = 2;
+    cfg.dcp = if (p.world == 3) 1 else 2;
     cfg.kv = if (o.kv_format == .bf16) .bf16 else .fp8;
     cfg.rank = @intCast(p.rank);
-    cfg.ranks = 2;
+    cfg.ranks = @intCast(p.world);
     const full_layers = cfg.full.count();
     const verify_max = try verifyMaxFromEnv(struct { fn get(name: []const u8) ?[]const u8 {
         if (!std.mem.eql(u8, name, "TF_GLM53_VERIFY_MAX")) return null;
@@ -975,7 +978,7 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
 
     const prompt_mla = forward.promptMlaSwitch();
     const coll_fuse_requested = collFuseSwitch();
-    const coll_fuse = coll_fuse_requested and collFusePayloadFits(verify_max, 4 << 20);
+    const coll_fuse = p.world == 2 and coll_fuse_requested and collFusePayloadFits(verify_max, 4 << 20);
     if (coll_fuse_requested and !coll_fuse) std.log.info("TF_GLM53_COLL_FUSE disabled for this decode shape: packed query or attention partial exceeds the 4 MiB RoCE cap", .{});
     const smla_p = forward.smlaPSwitch();
     const shard_qkv_a = forward.shardQkvASwitch();
@@ -1051,7 +1054,7 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
     const graph_reserve_bytes = try state.graphsReserveFromEnv(verify_max, o.context);
     const drafter_share = drafts.shareScratchEnabled();
     const pe_flags = forward.promptExpertsFlags(prompt_experts);
-    var geometry: state.Geometry = .{ .full_index_layers = full_layers, .cache_format = if (o.kv_format == .bf16) .bf16 else .fp8, .vocab_local = cfg.vocab / 2, .expert_rows = rows, .index_mma_rows = index_mma_rows, .chunk_rows = chunk_rows, .decode_rows = verify_max, .head_rows = verify_max, .candidate_k = try state.sampleKFromEnv(), .graphs_bytes = graph_reserve_bytes, .drafter_share_bytes = 0, .prefetch = prefetch_enabled, .tbo = tbo_enabled, .piece_pipe = piece_pipe, .moe_pipe = moe_pipe, .ws_trim = ws_trim, .moe_post = moe_post, .comm_prio = comm_prio, .index_merge = index_merge, .index_pipe = index_pipe, .prompt_mla = prompt_mla, .smla_p = smla_p, .smla_fp8 = smla_fp8, .smla_p3 = smla_p3, .shard_qkv_a = shard_qkv_a, .prefill_bf16 = prefill_bf16, .decode_side = decode_side, .decode_mla = decode_mla_mode != .off, .decode_mla_v2 = decode_mla_mode == .v2 or decode_mla_mode == .v3, .decode_mla_v3 = decode_mla_mode == .v3, .prompt_experts = pe_flags.on, .prompt_experts_wide = pe_flags.wide, .prompt_experts_pmx = pe_flags.pmx, .scratch_overlay = scratch_overlay, .slim_generic = slim_generic, .coll_fuse = coll_fuse, .expert_rows_adapt = adapt_rows, .expert_rows_adapt_maxpos = adapt_maxpos, .prompt_experts_p5a = pe_flags.p5a };
+    var geometry: state.Geometry = .{ .world = p.world, .full_index_layers = full_layers, .cache_format = if (o.kv_format == .bf16) .bf16 else .fp8, .vocab_local = if (p.world == 3) (if (p.rank == 0) 51712 else 51584) else cfg.vocab / 2, .expert_rows = rows, .index_mma_rows = index_mma_rows, .chunk_rows = chunk_rows, .decode_rows = verify_max, .head_rows = verify_max, .candidate_k = try state.sampleKFromEnv(), .graphs_bytes = graph_reserve_bytes, .drafter_share_bytes = 0, .prefetch = prefetch_enabled, .tbo = tbo_enabled, .piece_pipe = piece_pipe, .moe_pipe = moe_pipe, .ws_trim = ws_trim, .moe_post = moe_post, .comm_prio = comm_prio, .index_merge = index_merge, .index_pipe = index_pipe, .prompt_mla = prompt_mla, .smla_p = smla_p, .smla_fp8 = smla_fp8, .smla_p3 = smla_p3, .shard_qkv_a = shard_qkv_a, .prefill_bf16 = prefill_bf16, .decode_side = decode_side, .decode_mla = decode_mla_mode != .off, .decode_mla_v2 = decode_mla_mode == .v2 or decode_mla_mode == .v3, .decode_mla_v3 = decode_mla_mode == .v3, .prompt_experts = pe_flags.on, .prompt_experts_wide = pe_flags.wide, .prompt_experts_pmx = pe_flags.pmx, .scratch_overlay = scratch_overlay, .slim_generic = slim_generic, .coll_fuse = coll_fuse, .expert_rows_adapt = adapt_rows, .expert_rows_adapt_maxpos = adapt_maxpos, .prompt_experts_p5a = pe_flags.p5a };
     std.log.info("glm53 head: sampled candidate capacity k={d} per rank (TF_GLM53_SAMPLE_K; default 256)", .{geometry.candidate_k});
     const side_rows = try state.sideRowsFromEnv(geometry.piece_rows, o.context);
     if (side_rows != 0 and !residentEnabled()) return error.SideRowsNeedResident;
@@ -1069,12 +1072,12 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
     std.log.info("TF_GLM53_SCRATCH_OVERLAY={s}: workspace total {d} bytes (without overlay {d} bytes)", .{ if (scratch_overlay) "on" else "off", state.workspaceLayout(geometry, o.context).bytes, state.workspaceLayout(geometry_without_overlay, o.context).bytes });
 
     const selection: weights.Select = .{ .manifest = if (mf) |*m| m else null, .shard_qkv_a = shard_qkv_a };
-    var plan = try weights.planRank(gpa, io, dir, cfg, p.rank, 2, selection);
+    var plan = try weights.planRank(gpa, io, dir, cfg, p.rank, p.world, selection);
     defer plan.deinit(gpa);
     var drafter_geometry: ?drafts.Geometry = null;
     if (o.drafter) |dd| {
         const g = try drafts.checkConfig(gpa, io, dd);
-        const dm = try drafts.memoryPlan(g, 4, 2, 1);
+        const dm = try drafts.memoryPlan(g, 4, p.world, 1);
         if (drafter_share) {
             plan.weights.drafter = dm.deviceBytesWithSharedScratch() + dm.hostBytes();
             geometry.drafter_share_bytes = dm.shared_scratch;
@@ -1145,9 +1148,9 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
     errdefer if (lib_open) lib.close();
     const id = try ncclId(io, &lib, p, leader);
     var comm: cuda.nccl.Comm = null;
-    try lib.check(lib.api.ncclCommInitRank(&comm, 2, id, @intCast(p.rank)), "ncclCommInitRank");
+    try lib.check(lib.api.ncclCommInitRank(&comm, @intCast(p.world), id, @intCast(p.rank)), "ncclCommInitRank");
     tracer.step("NCCL communicator", .nccl, 0);
-    own.group = .{ .lib = lib, .comm = comm, .rank = p.rank, .world = 2 };
+    own.group = .{ .lib = lib, .comm = comm, .rank = p.rank, .world = p.world };
     own.alive_group = true;
     lib_open = false;
     step.mark(gpa, io, "NCCL communicator");
@@ -1158,9 +1161,11 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
     step.mark(gpa, io, "stream + RoCE shards");
     tracer.step("RoCE shards", .nccl, 4 << 20);
     const local_switches = PrefillCommSwitches{ .prefetch = @intFromBool(geometry.prefetch), .tbo = @intFromBool(geometry.tbo), .coll_fuse = @intFromBool(geometry.coll_fuse), .index_pipe = @intFromBool(geometry.index_pipe), .attn_pipe = @intFromBool(attn_pipe) };
-    var peer_switches: [2]PrefillCommSwitches = undefined;
-    try own.group.gather(PrefillCommSwitches, ctx.d, own.stream, local_switches, &peer_switches);
-    if (!agreesPrefillCommSwitches(peer_switches[0], peer_switches[1])) return error.PrefillCommunicationSettingsDisagree;
+    var peer_switches: [8]PrefillCommSwitches = undefined;
+    try own.group.gather(PrefillCommSwitches, ctx.d, own.stream, local_switches, peer_switches[0..p.world]);
+    for (peer_switches[1..p.world]) |peer| {
+        if (!agreesPrefillCommSwitches(peer_switches[0], peer)) return error.PrefillCommunicationSettingsDisagree;
+    }
     if (geometry.index_pipe and !geometry.piece_pipe and !geometry.moe_pipe) return error.IndexPipeRequiresCommStream;
     if (geometry.prefetch) {
         // Both ranks make and exchange the side NCCL unique id in this same startup position, before weight loading.
@@ -1221,7 +1226,7 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
         step.mark(gpa, io, "ablation weights");
     }
     const weights_vmm = weights.weightsVmmFromLookup(weights.processEnvLookup);
-    own.model = try weights.ModelWeights.loadConfig(dir, cfg, p.rank, 2, .{ .allocator = gpa, .io = io, .driver = ctx.d, .device_ordinal = ctx.device, .admission = &admission, .weights_vmm = weights_vmm, .trace = .{ .ctx = &tracer, .call = traceWeightLoad } }, selection);
+    own.model = try weights.ModelWeights.loadConfig(dir, cfg, p.rank, p.world, .{ .allocator = gpa, .io = io, .driver = ctx.d, .device_ordinal = ctx.device, .admission = &admission, .weights_vmm = weights_vmm, .trace = .{ .ctx = &tracer, .call = traceWeightLoad } }, selection);
     own.alive_model = true;
     tracer.step("weight model load aggregate", .vmm, plan.weights.total() - (plan.weights.drafter orelse 0));
     if (prompt_experts == .wide) {
@@ -1296,13 +1301,15 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
         std.log.info("glm53 expert rows adapt: off", .{});
     }
     const adapt_local = ExpertRowsAdaptAgreement{ .rows = @intCast(adapt_rows), .pad = 0, .limit = adapt_limit_position };
-    var adapt_peer: [2]ExpertRowsAdaptAgreement = undefined;
-    try own.group.gather(ExpertRowsAdaptAgreement, ctx.d, own.stream, adapt_local, &adapt_peer);
-    if (!agreesExpertRowsAdapt(adapt_peer[0], adapt_peer[1])) return error.ExpertRowsAdaptDisagree;
+    var adapt_peer: [3]ExpertRowsAdaptAgreement = undefined;
+    try own.group.gather(ExpertRowsAdaptAgreement, ctx.d, own.stream, adapt_local, adapt_peer[0..p.world]);
+    for (adapt_peer[1..p.world]) |peer| {
+        if (!agreesExpertRowsAdapt(adapt_peer[0], peer)) return error.ExpertRowsAdaptDisagree;
+    }
     var vmm_owned = state_vmm != null;
     defer if (vmm_owned) state_vmm.?.close();
     vmm_owned = false; // initWith takes ownership on both success and failure
-    own.st = try state.State.initWith(ctx.d, ctx.device, state_vmm, geometry, o.context, p.rank, 2, &admission, after.available);
+    own.st = try state.State.initWith(ctx.d, ctx.device, state_vmm, geometry, o.context, p.rank, p.world, &admission, after.available);
     own.alive_state = true;
     if (own.group.fast != null) if (own.st.adapt) |ad| {
         if (!state.adaptRoceAligned(ad.ws)) return error.ExpertRowsAdaptRoceMisaligned;
@@ -1310,7 +1317,7 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
     };
     if (own.alive_host and drafter_share) try own.host.dr.?.bindSharedWorkspace(own.st.ws.phase, own.st.ws.phase_bytes);
     step.mark(gpa, io, "State (KV, indexer keys, workspace)");
-    own.engine = .{ .gpa = gpa, .io = io, .f = .{ .gpa = gpa, .k = &own.kernels, .w = &own.model, .st = &own.st, .stream = own.stream, .coll = forward.Collective.group(&own.group), .prompt_experts_p5a = geometry.prompt_experts_p5a, .decode_union = decode_union, .decode_union_rows = decode_union_rows, .pre_fuse = geometry.pre_fuse, .prep_fuse = geometry.prep_fuse, .ws_trim = geometry.ws_trim, .moe_post = geometry.moe_post, .comm_prio = geometry.comm_prio, .pipe_coll = if (own.alive_pipe_group) own.pipe_group.?.collective() else null, .rank = p.rank, .chunk_rows = geometry.chunk_rows, .decode_side = geometry.decode_side, .prompt_experts = geometry.prompt_experts, .prompt_experts_wide = geometry.prompt_experts_wide, .prompt_experts_pmx = geometry.prompt_experts_pmx, .prompt_mla = geometry.prompt_mla, .smla_p = geometry.smla_p, .smla_fp8 = geometry.smla_fp8, .smla_p3 = geometry.smla_p3, .shard_qkv_a = geometry.shard_qkv_a, .prefill_w8a8 = geometry.prefill_w8a8, .prefetch = if (geometry.prefetch) &own.pf else null, .prefetch_enabled = geometry.prefetch, .tbo_enabled = geometry.tbo, .piece_pipe = geometry.piece_pipe, .moe_pipe = geometry.moe_pipe, .index_merge = geometry.index_merge, .index_pipe = geometry.index_pipe, .lowrank_decode = lowrank_decode, .coll_fuse = geometry.coll_fuse, .index_mma_rows = geometry.index_mma_rows, .row_prune = row_prune }, .defer_draft_fill = defer_draft_fill, .mem = try uma.MemTrace.fromEnv(p.rank) };
+    own.engine = .{ .gpa = gpa, .io = io, .world = p.world, .f = .{ .gpa = gpa, .k = &own.kernels, .w = &own.model, .st = &own.st, .stream = own.stream, .coll = forward.Collective.group(&own.group), .prompt_experts_p5a = geometry.prompt_experts_p5a, .decode_union = decode_union, .decode_union_rows = decode_union_rows, .pre_fuse = geometry.pre_fuse, .prep_fuse = geometry.prep_fuse, .ws_trim = geometry.ws_trim, .moe_post = geometry.moe_post, .comm_prio = geometry.comm_prio, .pipe_coll = if (own.alive_pipe_group) own.pipe_group.?.collective() else null, .rank = p.rank, .chunk_rows = geometry.chunk_rows, .decode_side = geometry.decode_side, .prompt_experts = geometry.prompt_experts, .prompt_experts_wide = geometry.prompt_experts_wide, .prompt_experts_pmx = geometry.prompt_experts_pmx, .prompt_mla = geometry.prompt_mla, .smla_p = geometry.smla_p, .smla_fp8 = geometry.smla_fp8, .smla_p3 = geometry.smla_p3, .shard_qkv_a = geometry.shard_qkv_a, .prefill_w8a8 = geometry.prefill_w8a8, .prefetch = if (geometry.prefetch) &own.pf else null, .prefetch_enabled = geometry.prefetch, .tbo_enabled = geometry.tbo, .piece_pipe = geometry.piece_pipe, .moe_pipe = geometry.moe_pipe, .index_merge = geometry.index_merge, .index_pipe = geometry.index_pipe, .lowrank_decode = lowrank_decode, .coll_fuse = geometry.coll_fuse, .index_mma_rows = geometry.index_mma_rows, .row_prune = row_prune }, .defer_draft_fill = defer_draft_fill, .mem = try uma.MemTrace.fromEnv(p.rank) };
     if (memslim) {
         own.engine.graph_allow = own.graph_keys;
         own.engine.decode_graph_max = @intCast(live_rows);
@@ -1436,7 +1443,7 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
     try cuda.tp_watch.ready(io, digest);
     if (prefix_cache_enabled) {
         const a = try prefix_cache.kvsave.cutAlignment(try expertRows());
-        const identity = prefix_cache.kvsave.identityOf(digest, prefixCacheFatbinIdentity(), try prefixCacheExecutableIdentity(), @intCast(p.rank), 2, @intCast(a));
+        const identity = prefix_cache.kvsave.identityOf(digest, prefixCacheFatbinIdentity(), try prefixCacheExecutableIdentity(), @intCast(p.rank), @intCast(p.world), @intCast(a));
         const hex = std.fmt.bytesToHex(identity, .lower);
         const cache_path = try std.fmt.allocPrintSentinel(gpa, "{s}/{s}/rank{d}", .{ prefix_cache_dir.?, &hex, p.rank }, 0);
         defer gpa.free(cache_path);
@@ -1926,10 +1933,14 @@ fn settingsDigest(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, o: Option
         hash.update(drafter_config);
         hash.update(std.mem.asBytes(&o.drafter_bits));
     }
-    const w = [_]u64{ plan.weights.routed, plan.weights.backbone_fp8, plan.weights.embed_head, plan.weights.router_norms, plan.weights.lowrank, plan.weights.drafter orelse 0 };
-    const logical = [_]u64{ plan.logical.routed, plan.logical.backbone_fp8, plan.logical.embed_head, plan.logical.router_norms, plan.logical.lowrank, plan.logical.drafter orelse 0 };
-    hash.update(std.mem.sliceAsBytes(&w));
-    hash.update(std.mem.sliceAsBytes(&logical));
+    if (cfg.ranks == 2) {
+        const w = [_]u64{ plan.weights.routed, plan.weights.backbone_fp8, plan.weights.embed_head, plan.weights.router_norms, plan.weights.lowrank, plan.weights.drafter orelse 0 };
+        const logical = [_]u64{ plan.logical.routed, plan.logical.backbone_fp8, plan.logical.embed_head, plan.logical.router_norms, plan.logical.lowrank, plan.logical.drafter orelse 0 };
+        hash.update(std.mem.sliceAsBytes(&w));
+        hash.update(std.mem.sliceAsBytes(&logical));
+    } else {
+        hash.update(std.mem.asBytes(&cfg.ranks));
+    }
     if (ablate_digest) |digest| hash.update(&digest);
     for (plan.unused) |name| hash.update(name);
     var out: [32]u8 = undefined;

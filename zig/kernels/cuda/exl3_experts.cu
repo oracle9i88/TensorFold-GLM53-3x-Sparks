@@ -562,6 +562,14 @@ extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_gu_e4m3(cons
     TF_VBLOCK_ENTER();
     tf_exl3_prompt_gu_body<CB_MCG_E4M3>(Xg, Xu, Tg, Tu, items, counts, members, svh_g, svh_u, suh_d, xd, K, N, xdiv, limit, act_mode, k2g, k2u);
 }
+// The same with GLM-5.3's mul1 codebook (decode_lane<K2, CB_MUL1>).
+extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_gu_mul1(const half* __restrict__ Xg, const half* __restrict__ Xu,
+        const uint64_t* __restrict__ Tg, const uint64_t* __restrict__ Tu, const int* __restrict__ items, const int* __restrict__ counts,
+        const int* __restrict__ members, const half* __restrict__ svh_g, const half* __restrict__ svh_u, const half* __restrict__ suh_d,
+        half* __restrict__ xd, int K, int N, int xdiv, float limit, int act_mode, const int* __restrict__ k2g, const int* __restrict__ k2u) {
+    TF_VBLOCK_ENTER();
+    tf_exl3_prompt_gu_body<CB_MUL1>(Xg, Xu, Tg, Tu, items, counts, members, svh_g, svh_u, suh_d, xd, K, N, xdiv, limit, act_mode, k2g, k2u);
+}
 
 // Block (256 model-width columns, item): y[row][slot][:] = the down epilogue of the item's pairs (this rank's share).
 template <int CB>
@@ -611,6 +619,12 @@ extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down_e4m3(co
     TF_VBLOCK_ENTER();
     tf_exl3_prompt_down_body<CB_MCG_E4M3>(Xd, Td, items, counts, members, svh_d, y, K, D, ys, k2d);
 }
+extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down_mul1(const half* __restrict__ Xd, const uint64_t* __restrict__ Td,
+        const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d,
+        float* __restrict__ y, int K, int D, int ys, const int* __restrict__ k2d) {
+    TF_VBLOCK_ENTER();
+    tf_exl3_prompt_down_body<CB_MUL1>(Xd, Td, items, counts, members, svh_d, y, K, D, ys, k2d);
+}
 
 // TF_GLM53_PROMPT_EXPERTS=2 over a 128-member plan (exl3_prompt.cuh's wide path); every output has the bits of
 // tf_exl3_prompt_gu/down. The _s entries are those kernels unchanged for items of 64 members or fewer (larger items
@@ -635,6 +649,14 @@ extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_gu_s_e4m3(co
     if (!tf_exl3_prompt_small(items, counts)) return;
     tf_exl3_prompt_gu_body<CB_MCG_E4M3>(Xg, Xu, Tg, Tu, items, counts, members, svh_g, svh_u, suh_d, xd, K, N, xdiv, limit, act_mode, k2g, k2u);
 }
+extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_gu_s_mul1(const half* __restrict__ Xg, const half* __restrict__ Xu,
+        const uint64_t* __restrict__ Tg, const uint64_t* __restrict__ Tu, const int* __restrict__ items, const int* __restrict__ counts,
+        const int* __restrict__ members, const half* __restrict__ svh_g, const half* __restrict__ svh_u, const half* __restrict__ suh_d,
+        half* __restrict__ xd, int K, int N, int xdiv, float limit, int act_mode, const int* __restrict__ k2g, const int* __restrict__ k2u) {
+    TF_VBLOCK_ENTER();
+    if (!tf_exl3_prompt_small(items, counts)) return;
+    tf_exl3_prompt_gu_body<CB_MUL1>(Xg, Xu, Tg, Tu, items, counts, members, svh_g, svh_u, suh_d, xd, K, N, xdiv, limit, act_mode, k2g, k2u);
+}
 extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down_s(const half* __restrict__ Xd, const uint64_t* __restrict__ Td,
         const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d,
         float* __restrict__ y, int K, int D, int ys, const int* __restrict__ k2d) {
@@ -648,6 +670,13 @@ extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down_s_e4m3(
     TF_VBLOCK_ENTER();
     if (!tf_exl3_prompt_small(items, counts)) return;
     tf_exl3_prompt_down_body<CB_MCG_E4M3>(Xd, Td, items, counts, members, svh_d, y, K, D, ys, k2d);
+}
+extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down_s_mul1(const half* __restrict__ Xd, const uint64_t* __restrict__ Td,
+        const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d,
+        float* __restrict__ y, int K, int D, int ys, const int* __restrict__ k2d) {
+    TF_VBLOCK_ENTER();
+    if (!tf_exl3_prompt_small(items, counts)) return;
+    tf_exl3_prompt_down_body<CB_MUL1>(Xd, Td, items, counts, members, svh_d, y, K, D, ys, k2d);
 }
 
 #define TF_EXL3_PROMPT_WIDE(SUFFIX, CBV)                                                                                   \
@@ -681,4 +710,5 @@ extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down_s_e4m3(
     }
 TF_EXL3_PROMPT_WIDE(, CB_MCG)
 TF_EXL3_PROMPT_WIDE(_e4m3, CB_MCG_E4M3)
+TF_EXL3_PROMPT_WIDE(_mul1, CB_MUL1)
 #undef TF_EXL3_PROMPT_WIDE

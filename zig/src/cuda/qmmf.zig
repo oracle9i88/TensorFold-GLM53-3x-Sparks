@@ -423,6 +423,7 @@ test "instance names are qmmf.cu's" {
 fn groupTestWeight(n: u32) Weight { return .{ .mode = .fp8b, .codes = 0x1000, .scales = 0x2000, .n = n, .k = 6144, .npad = (n + 127) / 128 * 128 }; }
 
 test "group plans preserve projection plans and ABI" {
+    @setEvalBranchQuota(10000);
     const ws = [_]GroupOut{ .{ .w = groupTestWeight(2048), .y = 1 }, .{ .w = groupTestWeight(576), .y = 2 }, .{ .w = groupTestWeight(128), .y = 3 } };
     for ([_]usize{ 1, 4, 8, 16 }) |m| {
         const g = try groupPlan(m, 6144, &ws, true, false);
@@ -431,7 +432,7 @@ test "group plans preserve projection plans and ABI" {
     for ([_]usize{ 17, 32 }) |m| { const g = try groupPlan(m, 6144, &ws, true, false); try std.testing.expect(g.plan.bm == 32 and g.kernel == 1 and g.total == 43); }
     const p200 = try groupPlan(200, 6144, &ws, true, false);
     try std.testing.expect(p200.plan.bm == 64 and p200.kernel == 2 and p200.blocks[0] == 128 and p200.blocks[1] == 36 and p200.blocks[2] == 8 and p200.total == 172 and p200.band == 4);
-    for ([_]usize{ 512, 2048 }) |m| {
+    inline for ([_]usize{ 512, 2048 }) |m| {
         const normal = try groupPlan(m, 6144, &ws, true, false);
         const forced = try groupPlan(m, 6144, &ws, true, true);
         try std.testing.expect(normal.plan.fused and normal.kernel == 3);

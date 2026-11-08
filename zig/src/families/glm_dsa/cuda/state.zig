@@ -45,6 +45,9 @@ test "sample candidate K defaults to 256 and rejects invalid or oversized widths
     try std.testing.expectError(error.BadSampleK, parseSampleK("2049"));
 }
 pub const dcp_world = 2;
+pub fn dcpWorld(world: usize) usize {
+    return if (world == 3) 1 else 2;
+}
 pub const default_chunk_rows = 4096;
 pub const dense_limit = index.dense_limit;
 pub const kv_row_bytes = (mla.latent_dim + mla.rope_dim) * 2;
@@ -332,6 +335,7 @@ pub fn serveGate(avail: u64, free: u64, min_avail: u64, min_free: u64) GateVerdi
 
 /// Allocation geometry. Admission is separate (admitRank), done once per rank before weights and State.
 pub const Geometry = struct {
+    world: usize = 2,
     layers: usize = 78,
     full_index_layers: usize = 21,
     cache_format: CacheFormat = .bf16,
@@ -436,7 +440,7 @@ pub fn validateMoePipeGeometry(g: Geometry) !void {
     const pieces = (g.expert_rows + @as(usize, @intCast(pr)) - 1) / @as(usize, @intCast(pr));
     if (pieces > Workspace.max_moe_pipe_pieces) return error.MoePipeTooManyPieces;
     const stride = std.math.mul(u64, pr, hidden * 2) catch return error.MoePipeRingTooLarge;
-    const slot_bytes = std.math.mul(u64, stride, if (g.moe_post) dcp_world else 1 + dcp_world) catch return error.MoePipeRingTooLarge;
+    const slot_bytes = std.math.mul(u64, stride, if (g.moe_post) g.world else 1 + g.world) catch return error.MoePipeRingTooLarge;
     _ = std.math.mul(u64, slot_bytes, Workspace.moe_pipe_ring_slots) catch return error.MoePipeRingTooLarge;
 }
 
@@ -1100,12 +1104,13 @@ pub const Workspace = struct {
         w.x = take(&at, w.sizes.x);
         w.sizes.xn = batch_rows * hidden * 2;
         w.xn = take(&at, w.sizes.xn);
-        // The TP reduce (and the bf16 embed gather) of one piece: [2][piece][6144] fp32.
-        w.sizes.gathered = dcp_world * pr * hidden * 4;
+        // The TP reduce (and the bf16 embed gather) of one piece: [tp_world][piece][6144] fp32.
+        const tp_world = g.world;
+        w.sizes.gathered = tp_world * pr * hidden * 4;
         w.gathered = take(&at, w.sizes.gathered);
         if (g.tbo) {
             const half_rows = (pr + 1) / 2;
-            const half_bytes = dcp_world * half_rows * hidden * 4;
+            const half_bytes = tp_world * half_rows * hidden * 4;
             for (0..2) |half| {
                 w.sizes.tbo_gathered[half] = half_bytes;
                 w.tbo_gathered[half] = take(&at, half_bytes);
@@ -1121,7 +1126,7 @@ pub const Workspace = struct {
             for (0..2) |ring_slot| {
                 w.sizes.pipe_src[ring_slot] = pr * hidden * 4;
                 w.pipe_src[ring_slot] = take(&at, w.sizes.pipe_src[ring_slot]);
-                w.sizes.pipe_gather[ring_slot] = dcp_world * pr * hidden * 4;
+                w.sizes.pipe_gather[ring_slot] = tp_world * pr * hidden * 4;
                 w.pipe_gather[ring_slot] = take(&at, w.sizes.pipe_gather[ring_slot]);
             }
         } else {
@@ -1136,7 +1141,7 @@ pub const Workspace = struct {
         if (g.moe_pipe) {
             const moe_slots: usize = Workspace.moe_pipe_ring_slots;
             const stride = pr * hidden * 2;
-            const slot_bytes = stride * @as(u64, if (g.moe_post) dcp_world else 1 + dcp_world);
+            const slot_bytes = stride * @as(u64, if (g.moe_post) tp_world else 1 + tp_world);
             const ring_bytes = @as(u64, @intCast(moe_slots)) * slot_bytes;
             w.sizes.moe_pipe = ring_bytes;
             w.moe_pipe_slots = moe_slots;
@@ -1222,14 +1227,15 @@ pub const Workspace = struct {
         w.iq = take(&at, w.sizes.iq);
         w.sizes.qi = pr * index_heads * index_dim * 2;
         w.qi = take(&at, w.sizes.qi);
-        w.sizes.qa = @max(dcp_world * dr * local_heads * mla.latent_dim * 2, pr * local_heads * mla.latent_dim * 2);
+        const dcp_w = dcpWorld(g.world);
+        w.sizes.qa = @max(dcp_w * dr * local_heads * mla.latent_dim * 2, pr * local_heads * mla.latent_dim * 2);
         w.qa = take(&at, w.sizes.qa);
-        w.sizes.qpe = @max(dcp_world * dr * local_heads * mla.rope_dim * 2, pr * local_heads * mla.rope_dim * 2);
+        w.sizes.qpe = @max(dcp_w * dr * local_heads * mla.rope_dim * 2, pr * local_heads * mla.rope_dim * 2);
         w.qpe = take(&at, w.sizes.qpe);
-        w.sizes.fused_queries = if (g.coll_fuse) dcp_world * dr * local_heads * (mla.latent_dim + mla.rope_dim) * 2 else 0;
+        w.sizes.fused_queries = if (g.coll_fuse) dcp_w * dr * local_heads * (mla.latent_dim + mla.rope_dim) * 2 else 0;
         w.fused_queries = take(&at, w.sizes.fused_queries);
         // Decode computes both 32-head groups locally (2 blocks) and receives only the peer's matching block.
-        w.sizes.part = @max((dcp_world + 1) * dr * decode_partial_row_bytes, pr * local_heads * (mla.latent_dim * 2 + 4));
+        w.sizes.part = @max((dcp_w + 1) * dr * decode_partial_row_bytes, pr * local_heads * (mla.latent_dim * 2 + 4));
         w.part = take(&at, w.sizes.part);
         w.sizes.ol = dr * local_heads * mla.latent_dim * 2;
         w.ol = take(&at, w.sizes.ol);
@@ -1248,7 +1254,7 @@ pub const Workspace = struct {
         const index_rows = if (g.index_pipe) pr else sr;
         w.sizes.candidate_records = index_rows * top_k * 8;
         w.candidate_records = take(&at, w.sizes.candidate_records);
-        w.sizes.gathered_candidates = dcp_world * index_rows * top_k * 8;
+        w.sizes.gathered_candidates = dcp_w * index_rows * top_k * 8;
         w.gathered_candidates = take(&at, w.sizes.gathered_candidates);
         if (g.smla_p3) {
             // Written by tf_glm53_smla_union and read by tf_glm53_smla_p3 inside one piece's attend: attention-phase only.
@@ -1338,7 +1344,7 @@ pub const Workspace = struct {
         w.cand_ids = take(&at, w.sizes.cand_ids);
         w.sizes.cand_scratch = candidateScratchBytes(@intCast(hr), g.candidate_k) catch unreachable;
         w.cand_scratch = take(&at, w.sizes.cand_scratch);
-        w.sizes.head_gather = dcp_world * hr * headRowBytes(g.candidate_k);
+        w.sizes.head_gather = g.world * hr * headRowBytes(g.candidate_k);
         w.head_gather = take(&at, w.sizes.head_gather);
         const head_end = at;
         at = @max(attention_end, @max(ffn_end, head_end));
@@ -1499,7 +1505,7 @@ pub const State = struct {
             v.unmapRange(v.va, v.va_len);
             v.close();
         };
-        if (world != dcp_world or rank >= world or context == 0) return error.DcpShape;
+        if ((world != dcp_world and world != 3) or rank >= world or context == 0) return error.DcpShape;
         if (geometry.expert_rows_adapt != 0 and maybe_vmm == null) return error.ExpertRowsAdaptNeedsVmm;
         if (maybe_vmm) |v| if (device) |d| if (v.device != d) {
             return error.ExpertRowsAdaptDeviceMismatch;

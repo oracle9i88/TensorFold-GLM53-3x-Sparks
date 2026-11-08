@@ -580,7 +580,7 @@ pub const Index = struct {
                 std.log.warn("prefix cache: skipping invalid header {s}: {s}", .{ path, @errorName(err) });
                 continue;
             };
-            if (h.rank != rank or h.world != 2 or h.at > std.math.maxInt(usize) or h.base_at > std.math.maxInt(usize) or
+            if (h.rank != rank or (h.world != 2 and h.world != 3) or h.at > std.math.maxInt(usize) or h.base_at > std.math.maxInt(usize) or
                 h.at % a != 0 or h.at % piece_rows != 0) {
                 std.log.warn("prefix cache: skipping incompatible header {s}", .{path});
                 continue;

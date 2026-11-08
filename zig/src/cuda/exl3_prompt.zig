@@ -28,7 +28,7 @@ pub fn eligible(l: ex.Layer) bool {
 
 /// Shapes accepted by the original 64-member path. The wide path has an additional scratch layout constraint.
 pub fn eligibleTiles(l: ex.Layer) bool {
-    return (l.codebook == .mcg or l.codebook == .mcg_e4m3) and l.widths_ok and l.gu_stride == 0 and l.dims > 0 and l.width > 0 and l.dims % 256 == 0 and l.width % 128 == 0 and (l.act_mode == 0 or l.act_mode == 1);
+    return (l.codebook == .mcg or l.codebook == .mcg_e4m3 or l.codebook == .mul1) and l.widths_ok and l.gu_stride == 0 and l.dims > 0 and l.width > 0 and l.dims % 256 == 0 and l.width % 128 == 0 and (l.act_mode == 0 or l.act_mode == 1);
 }
 
 /// TF_GLM53_PROMPT_EXPERTS=2 (exl3_prompt.cuh's wide path): a 128-member plan. Items of 64 members or fewer run the
@@ -39,24 +39,24 @@ pub const wide_threads: u32 = 256; // 8 warps; 64 fp32 accumulators a thread; 2 
 /// Dynamic shared memory of wup/wgate/wdown: 3 stages of 128 X rows and 8 tiles' trellis words
 /// (exl3_prompt.cuh wsmem_bytes).
 pub const wide_smem: u32 = 3 * (wide_tile * 40 * 2 + 8 * 2 * 32 * 4);
-/// The wide path's kernels of the exl3_experts image, [0] mcg and [1] mcg_e4m3.
+/// The wide path's kernels of the exl3_experts image, [0] mcg, [1] mcg_e4m3, [2] mul1.
 pub const Wide = struct {
-    gu_small: [2]Function,
-    down_small: [2]Function,
-    up: [2]Function,
-    gate: [2]Function,
-    down: [2]Function,
+    gu_small: [3]Function,
+    down_small: [3]Function,
+    up: [3]Function,
+    gate: [3]Function,
+    down: [3]Function,
 
     pub fn resolve(mod: Module) !Wide {
         const w: Wide = .{
-            .gu_small = .{ try mod.function("tf_exl3_prompt_gu_s"), try mod.function("tf_exl3_prompt_gu_s_e4m3") },
-            .down_small = .{ try mod.function("tf_exl3_prompt_down_s"), try mod.function("tf_exl3_prompt_down_s_e4m3") },
-            .up = .{ try mod.function("tf_exl3_prompt_wup"), try mod.function("tf_exl3_prompt_wup_e4m3") },
-            .gate = .{ try mod.function("tf_exl3_prompt_wgate"), try mod.function("tf_exl3_prompt_wgate_e4m3") },
-            .down = .{ try mod.function("tf_exl3_prompt_wdown"), try mod.function("tf_exl3_prompt_wdown_e4m3") },
+            .gu_small = .{ try mod.function("tf_exl3_prompt_gu_s"), try mod.function("tf_exl3_prompt_gu_s_e4m3"), try mod.function("tf_exl3_prompt_gu_s_mul1") },
+            .down_small = .{ try mod.function("tf_exl3_prompt_down_s"), try mod.function("tf_exl3_prompt_down_s_e4m3"), try mod.function("tf_exl3_prompt_down_s_mul1") },
+            .up = .{ try mod.function("tf_exl3_prompt_wup"), try mod.function("tf_exl3_prompt_wup_e4m3"), try mod.function("tf_exl3_prompt_wup_mul1") },
+            .gate = .{ try mod.function("tf_exl3_prompt_wgate"), try mod.function("tf_exl3_prompt_wgate_e4m3"), try mod.function("tf_exl3_prompt_wgate_mul1") },
+            .down = .{ try mod.function("tf_exl3_prompt_wdown"), try mod.function("tf_exl3_prompt_wdown_e4m3"), try mod.function("tf_exl3_prompt_wdown_mul1") },
         };
-        for ([_][2]Function{ w.up, w.gate, w.down }) |pair| {
-            for (pair) |f| try f.allowDynamicShared(wide_smem);
+        for ([_][3]Function{ w.up, w.gate, w.down }) |triple| {
+            for (triple) |f| try f.allowDynamicShared(wide_smem);
         }
         return w;
     }
@@ -117,10 +117,21 @@ pub const Kernels = struct {
     down: Function,
     gateup_e4m3: Function,
     down_e4m3: Function,
+    gateup_mul1: Function,
+    down_mul1: Function,
     /// The TF_GLM53_PROMPT_EXPERTS=2 kernels; null where a caller builds Kernels by hand without them.
     wide: ?Wide = null,
     pub fn resolve(mod: Module) !Kernels {
-        return .{ .rotate = try mod.function("tf_exl3_prompt_rotate"), .gateup = try mod.function("tf_exl3_prompt_gu"), .down = try mod.function("tf_exl3_prompt_down"), .gateup_e4m3 = try mod.function("tf_exl3_prompt_gu_e4m3"), .down_e4m3 = try mod.function("tf_exl3_prompt_down_e4m3"), .wide = Wide.resolve(mod) catch null };
+        return .{
+            .rotate = try mod.function("tf_exl3_prompt_rotate"),
+            .gateup = try mod.function("tf_exl3_prompt_gu"),
+            .down = try mod.function("tf_exl3_prompt_down"),
+            .gateup_e4m3 = try mod.function("tf_exl3_prompt_gu_e4m3"),
+            .down_e4m3 = try mod.function("tf_exl3_prompt_down_e4m3"),
+            .gateup_mul1 = try mod.function("tf_exl3_prompt_gu_mul1"),
+            .down_mul1 = try mod.function("tf_exl3_prompt_down_mul1"),
+            .wide = Wide.resolve(mod) catch null,
+        };
     }
     pub fn run(k: Kernels, e: *const ex.Experts, router: grouped.Router, s: Stream, l: ex.Layer, x: u64, stride: usize, picks: u64, rows: usize, sc: Scratch, p: grouped.Plan) !void {
         return k.runTile(e, router, s, l, x, stride, picks, rows, sc, p, tile);
@@ -211,21 +222,36 @@ pub const Kernels = struct {
     /// =1's gate/up (SwiGLU and the down rotation in the epilogue) over a plan made at `route_tile`.
     pub fn gateUpTiles(k: Kernels, s: Stream, l: ex.Layer, rows: usize, sc: Scratch, p: grouped.Plan, route_tile: usize) !void {
         const items = grouped.maxItems(rows * sc.slots, l.experts, route_tile);
-        const gateup = if (l.codebook == .mcg_e4m3) k.gateup_e4m3 else k.gateup;
+        const gateup = switch (l.codebook) {
+            .mcg_e4m3 => k.gateup_e4m3,
+            .mul1 => k.gateup_mul1,
+            .mcg => k.gateup,
+            else => return error.Exl3Shape,
+        };
         try go(gateup, s, .{ l.width / 128, items, 1 }, 256, guArgs(l, sc, p));
     }
 
     /// =1's down over a plan made at `route_tile`.
     pub fn downTiles(k: Kernels, s: Stream, l: ex.Layer, rows: usize, sc: Scratch, p: grouped.Plan, route_tile: usize) !void {
         const items = grouped.maxItems(rows * sc.slots, l.experts, route_tile);
-        const down = if (l.codebook == .mcg_e4m3) k.down_e4m3 else k.down;
+        const down = switch (l.codebook) {
+            .mcg_e4m3 => k.down_e4m3,
+            .mul1 => k.down_mul1,
+            .mcg => k.down,
+            else => return error.Exl3Shape,
+        };
         try go(down, s, .{ l.dims / 256, items, 1 }, 256, downArgs(l, sc, p));
     }
 
     /// =2's gate/up: items <= 64 members on =1's kernel, larger ones up (uu into the y region) then gate (xd).
     pub fn gateUpWide(k: Kernels, s: Stream, l: ex.Layer, rows: usize, sc: Scratch, p: grouped.Plan) !void {
         const w = k.wide orelse return error.Exl3PromptWideMissing;
-        const c: usize = if (l.codebook == .mcg_e4m3) 1 else 0;
+        const c: usize = switch (l.codebook) {
+            .mcg => 0,
+            .mcg_e4m3 => 1,
+            .mul1 => 2,
+            else => return error.Exl3Shape,
+        };
         const items = grouped.maxItems(rows * sc.slots, l.experts, wide_tile);
         const xdiv = i(if (l.shared_input) sc.slots else 1);
         try go(w.gu_small[c], s, .{ l.width / 128, items, 1 }, 256, guArgs(l, sc, p));
@@ -236,7 +262,12 @@ pub const Kernels = struct {
     /// =2's down: items <= 64 members on =1's kernel, larger ones on 128-column wide blocks.
     pub fn downWide(k: Kernels, s: Stream, l: ex.Layer, rows: usize, sc: Scratch, p: grouped.Plan) !void {
         const w = k.wide orelse return error.Exl3PromptWideMissing;
-        const c: usize = if (l.codebook == .mcg_e4m3) 1 else 0;
+        const c: usize = switch (l.codebook) {
+            .mcg => 0,
+            .mcg_e4m3 => 1,
+            .mul1 => 2,
+            else => return error.Exl3Shape,
+        };
         const items = grouped.maxItems(rows * sc.slots, l.experts, wide_tile);
         try go(w.down_small[c], s, .{ l.dims / 256, items, 1 }, 256, downArgs(l, sc, p));
         try goShared(w.down[c], s, .{ l.dims / 128, items, 1 }, wide_threads, wide_smem, .{ sc.xd, l.down, p.items, p.counts, p.members, l.svh_d, sc.y, i(l.width), i(l.dims), l.down_k2 });

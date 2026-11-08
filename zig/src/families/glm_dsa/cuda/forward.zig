@@ -82,11 +82,11 @@ pub const Glue = struct {
     }
 
     /// glue.residual_add: xout = bf16(x + bf16(sum of `world` fp32 partials [world][rows][d], rank 0 first)).
-    pub fn residualAdd(g: *const Glue, stream: cuda.Stream, x: u64, xout: u64, parts: u64, rows: usize, d: usize) !void {
+    pub fn residualAdd(g: *const Glue, stream: cuda.Stream, x: u64, xout: u64, parts: u64, rows: usize, d: usize, tp_world: usize) !void {
         if (rows == 0) return;
         if (d % 8 != 0 or x % 16 != 0 or xout % 16 != 0 or parts % 16 != 0) return error.RowsUnaligned;
         var a: cuda.Args = .{};
-        inline for (.{ x, xout, parts, @as(i64, @intCast(rows * d)), @as(i64, @intCast(d)), @as(c_int, world) }) |v| a.add(v);
+        inline for (.{ x, xout, parts, @as(i64, @intCast(rows * d)), @as(i64, @intCast(d)), @as(c_int, @intCast(tp_world)) }) |v| a.add(v);
         try cuda.launch.launch(g.residual_add, .{ .grid = .{ .x = @intCast(rows), .y = @intCast((d + 1023) / 1024) }, .block = .{ .x = 128 } }, stream, &a);
     }
 
@@ -260,9 +260,9 @@ pub const SideGroup = struct {
         if (std.c.getenv("NCCL_COMM_ID") != null) return error.CommIdSetForSideComm;
         var mine: cuda.nccl.UniqueId = std.mem.zeroes(cuda.nccl.UniqueId);
         if (main.rank == 0) try main.lib.check(main.lib.api.ncclGetUniqueId(&mine), "ncclGetUniqueId (stage side)");
-        var all: [world]cuda.nccl.UniqueId = undefined;
-        if (main.world != world) return error.BadWorld;
-        try main.gather(cuda.nccl.UniqueId, d, s, mine, &all);
+        var all: [3]cuda.nccl.UniqueId = undefined;
+        if (main.world != 2 and main.world != 3) return error.BadWorld;
+        try main.gather(cuda.nccl.UniqueId, d, s, mine, all[0..main.world]);
         var comm: cuda.nccl.Comm = null;
         try main.lib.check(main.lib.api.ncclCommInitRank(&comm, @intCast(main.world), all[0], @intCast(main.rank)), "ncclCommInitRank (stage side)");
         return .{ .lib = &main.lib, .comm = comm, .rank = main.rank, .world = main.world };
@@ -962,6 +962,9 @@ pub const Chunk = struct { start: usize, end: usize };
 
 /// TF_GLM53_MK=1 turns on the MK8 deferred launch in decode steps (default off; prefill never defers).
 pub fn megakernelSwitch() bool {
+    if (std.c.getenv("TF_GLM_WORLD")) |w| {
+        if (std.mem.eql(u8, std.mem.span(w), "3")) return false;
+    }
     const v = std.c.getenv("TF_GLM53_MK") orelse return false;
     return std.mem.eql(u8, std.mem.span(v), "1");
 }
@@ -1253,6 +1256,11 @@ pub fn ropeRow(position: usize, cos: []f32, sin: []f32) void {
 /// A token another rank owns reads local row 0; embed_pick discards it.
 pub const EmbedRow = struct { owner: i32, local: i32 };
 pub fn embedRowFor(token: u32, rank: usize, vocab_local: usize) EmbedRow {
+    if (vocab_local == 51712 or vocab_local == 51584) {
+        const o: usize = if (token < 51712) 0 else if (token < 103296) 1 else 2;
+        const offset: u32 = if (o == 0) 0 else if (o == 1) 51712 else 103296;
+        return .{ .owner = @intCast(o), .local = if (o == rank) @intCast(token - offset) else 0 };
+    }
     const o = token / vocab_local;
     return .{ .owner = @intCast(o), .local = if (o == rank) @intCast(token - o * vocab_local) else 0 };
 }
@@ -1516,6 +1524,14 @@ pub const Forward = struct {
     prof_prefill: bool = false,
     prof_decode_sub: bool = false,
 
+    pub fn dcpRank(f: *const Forward) usize {
+        return if (f.st.world == 3) 0 else f.rank;
+    }
+
+    pub fn dcpWorld(f: *const Forward) usize {
+        return if (f.st.world == 3) 1 else 2;
+    }
+
     fn decodeSideEnabled(f: *const Forward) bool {
         return f.decode_side orelse decodeSideSwitch();
     }
@@ -1557,7 +1573,8 @@ pub const Forward = struct {
         if (f.prefill_w8a8) {
             if (f.k.w8a8 == null) return error.MissingW8a8Kernels;
             for (f.w.layers) |l| if (!cuda.w8a8.supports(l.attn.o_proj)) return error.W8a8Weight;
-            const vo_width = state.local_heads * mla.value_dim;
+            const max_heads: usize = if (f.st.world == 3) 22 else state.local_heads;
+            const vo_width = max_heads * mla.value_dim;
             if (f.st.ws.sizes.part < cuda.w8a8.scratchBytes(f.st.ws.piece_rows, vo_width)) return error.W8a8Scratch;
         }
         if (f.moe_pipe and f.tboEnabled()) return error.MoePipeWithTbo;
@@ -1675,6 +1692,7 @@ pub const Forward = struct {
     }
 
     fn prefetchEnabled(f: *const Forward) bool {
+        if (f.dcpWorld() <= 1) return false;
         return f.prefetch_enabled orelse (f.prefetch != null or prefetchSwitch());
     }
 
@@ -1937,7 +1955,7 @@ pub const Forward = struct {
             const next: ?usize = if (i + 1 < f.w.layers.len) i + 1 else null;
             // Gather-on-prefill (§3.4): the peer's cached keys below chunk_start into stage[p / 2], once a layer. Without
             // a prefetch stream it runs here, in order; kv_write adds this chunk's peer rows (disjoint slots).
-            if (prefill and f.activePrefetch() == null) try f.fetch(f.coll, f.stream, i, positions[0]);
+            if (prefill and f.dcpWorld() > 1 and f.activePrefetch() == null) try f.fetch(f.coll, f.stream, i, positions[0]);
             at = 0;
             // Last-layer pruning keeps cache writes for every row and limits post-attention work to rows needed by the head/taps.
             const prune_layer = prefill and f.w.config.layers != 0 and l.index == @as(usize, f.w.config.layers - 1) and f.rowPruneEnabled();
@@ -2035,6 +2053,7 @@ pub const Forward = struct {
     /// Stage fill for `layer`: this rank's own cache rows below chunk_start to the peer, the peer's into this
     /// rank's stage pair (layer % 2), counted per owner (rule 5), on `coll`'s communicator.
     fn fetch(f: *const Forward, coll: Collective, stream: cuda.Stream, layer: usize, chunk_start: usize) !void {
+        if (f.dcpWorld() <= 1) return;
         const peer = 1 - f.rank;
         const mine = stageFetchSlots(chunk_start, f.rank);
         const theirs = stageFetchSlots(chunk_start, peer);
@@ -2045,6 +2064,7 @@ pub const Forward = struct {
     /// fetch(L) on the side stream and its own communicator, at most one layer ahead (rule 3). Pair L % 2 was last
     /// read by attend(L-2) (fetch(L+1) waits on attend(L-1), rule 1); the event after it gates attend(L) (rule 2).
     fn prefetchLayer(f: *const Forward, layer: usize, chunk_start: usize) !void {
+        if (f.dcpWorld() <= 1) return;
         const pf = f.prefetch.?;
         const b = layer % state.stage_pairs;
         try pf.side.wait(pf.attended[b]);
@@ -2061,7 +2081,7 @@ pub const Forward = struct {
         const mine = ws.gathered + f.rank * bytes;
         try f.k.glue.embed(f.stream, ws.ids + p.start * 4, f.w.embed, mine, n, hidden);
         try f.coll.allGather(f.stream, mine, ws.gathered, bytes, .embed);
-        try moe.embedPick(f.k.glue53.embed_pick, f.stream, ws.gathered, ws.owners + p.start * 4, ws.x + p.start * hidden * 2, n, hidden, world);
+        try moe.embedPick(f.k.glue53.embed_pick, f.stream, ws.gathered, ws.owners + p.start * 4, ws.x + p.start * hidden * 2, n, hidden, @intCast(f.st.world));
     }
 
     /// This rank's fp32 partial slot for a piece of `n` rows in the per-piece reduce buffer [world][n][6144].
@@ -2097,7 +2117,7 @@ pub const Forward = struct {
         const n = p.end - p.start;
         const mine = if (f.moe_post) ws.moe_pipe_gather[ring_slot] + f.rank * n * hidden * 2 else ws.moe_pipe_src[ring_slot];
         try f.commColl().allGather(comm, mine, ws.moe_pipe_gather[ring_slot], n * hidden * 2, .moe_partial);
-        try moe.residualAddBf16(f.k.glue53.residual_add_bf16, comm, ws.x + p.start * hidden * 2, ws.moe_pipe_gather[ring_slot], p.end - p.start);
+        try moe.residualAddBf16(f.k.glue53.residual_add_bf16, comm, ws.x + p.start * hidden * 2, ws.moe_pipe_gather[ring_slot], p.end - p.start, f.st.world);
         if (f.ablate) |ab| if (ab.vec(layer, .ffn)) |v| try ab.launch(f.k.ablate.?, comm, ws.x + p.start * hidden * 2, ws.moe_pipe_gather[ring_slot], .bf16_parts, v, p.end - p.start, 0, 0, f.w.config.eps);
         try f.st.moe_pipe_done[ring_slot].?.record(comm);
         // One event per piece lets next-layer attention wait for precisely the rows it will read.
@@ -2155,7 +2175,7 @@ pub const Forward = struct {
         const n = p.end - p.start;
         var args: cuda.Args = .{};
         const xn = ws.xn + off * hidden * 2;
-        inline for (.{ ws.x + p.start * hidden * 2, ws.pipe_gather[ring_slot], norm, xn, @as(c_int, @intCast(n)), f.w.config.eps }) |v| args.add(v);
+        inline for (.{ ws.x + p.start * hidden * 2, ws.pipe_gather[ring_slot], norm, xn, @as(c_int, @intCast(n | (f.st.world << 24))), f.w.config.eps }) |v| args.add(v);
         try cuda.launch.launch(f.k.residual_rmsnorm_6144, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = 256 } }, f.stream, &args);
         try f.profileEnd(.prefill, layer, .attn_post);
     }
@@ -2173,7 +2193,7 @@ pub const Forward = struct {
         try moe.route(f.k.router(), f.stream, ws.xn + off * hidden * 2, hidden, m.router, m.bias, ws.router_logits, ws.router_part, ws.picks, ws.wts, n);
         try f.profileEnd(.prefill, l.index, .route);
         try f.profileBegin(.prefill, l.index, .shared);
-        try mlp.block(mlp_k, f.stream, m.shared, scratch, ws.xn + off * hidden * 2, n, mlp.shared_width, ws.shared_out + off * hidden * 4);
+        try mlp.block(mlp_k, f.stream, m.shared, scratch, ws.xn + off * hidden * 2, n, m.shared.down.k, ws.shared_out + off * hidden * 4);
         try f.profileEnd(.prefill, l.index, .shared);
         if (lr) |lr_weights| {
             try f.profileBegin(.prefill, l.index, .lowrank);
@@ -2204,12 +2224,13 @@ pub const Forward = struct {
             if (bf16_partial) return error.BadFusedNormPartial;
             var args: cuda.Args = .{};
             const xn = ws.xn + xn_off * hidden * 2;
-            inline for (.{ ws.x + p.start * hidden * 2, ws.gathered, weight, xn, @as(c_int, @intCast(n)), f.w.config.eps }) |v| args.add(v);
+            const rows_arg: c_int = @intCast(n | (f.st.world << 24));
+            inline for (.{ ws.x + p.start * hidden * 2, ws.gathered, weight, xn, rows_arg, f.w.config.eps }) |v| args.add(v);
             try cuda.launch.launch(f.k.residual_rmsnorm_6144, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = 256 } }, f.stream, &args);
         } else if (bf16_partial) {
-            try moe.residualAddBf16(f.k.glue53.residual_add_bf16, f.stream, ws.x + p.start * hidden * 2, ws.gathered, n);
+            try moe.residualAddBf16(f.k.glue53.residual_add_bf16, f.stream, ws.x + p.start * hidden * 2, ws.gathered, n, f.st.world);
         } else {
-            try f.k.glue.residualAdd(f.stream, ws.x + p.start * hidden * 2, ws.x + p.start * hidden * 2, ws.gathered, n, hidden);
+            try f.k.glue.residualAdd(f.stream, ws.x + p.start * hidden * 2, ws.x + p.start * hidden * 2, ws.gathered, n, hidden, f.st.world);
         }
     }
 
@@ -2221,12 +2242,13 @@ pub const Forward = struct {
         if (next_norm) |weight| {
             var args: cuda.Args = .{};
             const xn = ws.xn + xn_off * hidden * 2;
-            inline for (.{ ws.x + p.start * hidden * 2, gathered, weight, xn, @as(c_int, @intCast(n)), f.w.config.eps }) |v| args.add(v);
+            const rows_arg: c_int = @intCast(n | (f.st.world << 24));
+            inline for (.{ ws.x + p.start * hidden * 2, gathered, weight, xn, rows_arg, f.w.config.eps }) |v| args.add(v);
             try cuda.launch.launch(f.k.residual_rmsnorm_6144, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = 256 } }, f.stream, &args);
         } else if (bf16_partial) {
-            try moe.residualAddBf16(f.k.glue53.residual_add_bf16, f.stream, ws.x + p.start * hidden * 2, gathered, n);
+            try moe.residualAddBf16(f.k.glue53.residual_add_bf16, f.stream, ws.x + p.start * hidden * 2, gathered, n, f.st.world);
         } else {
-            try f.k.glue.residualAdd(f.stream, ws.x + p.start * hidden * 2, ws.x + p.start * hidden * 2, gathered, n, hidden);
+            try f.k.glue.residualAdd(f.stream, ws.x + p.start * hidden * 2, ws.x + p.start * hidden * 2, gathered, n, hidden, f.st.world);
         }
     }
 
@@ -2251,7 +2273,8 @@ pub const Forward = struct {
         // differed, tokens and logits equal) and its cause is still open.
         const side_on = mode == .decode and rows <= side_max_rows and f.decodeSideEnabled() and f.ablate == null and !megakernelSwitch();
         const eps = f.w.config.eps;
-        if (a.local_heads != state.local_heads) return error.BadHeadShare;
+        const expected_heads: usize = if (f.st.world == 3) (if (f.rank == 2) 20 else 22) else state.local_heads;
+        if (a.local_heads != expected_heads) return error.BadHeadShare;
         // Row inputs and the window-wide token list at this piece's rows.
         const positions_at = ws.positions + lo * 8;
         const cos = ws.cos + lo * rope_half * 4;
@@ -2269,9 +2292,9 @@ pub const Forward = struct {
             try f.profileSubEnd(mode, plane, .attn_pre_kv_a_proj);
             const cache_latent = f.st.latentAt(plane);
             const cache_rope = f.st.ropeAt(plane);
-            const cache_stage: ?types.StagePlanePair = f.st.stage.forLayer(plane).*;
+            const cache_stage: ?types.StagePlanePair = if (f.dcpWorld() == 1) null else f.st.stage.forLayer(plane).*;
             try f.profileSubBegin(mode, plane, .attn_pre_kv_a_norm_rope);
-            try k.mla.prep(s, ws.kv, a.kv_a_norm, cos, sin, positions_at, cache_latent, cache_rope, cache_stage, rows, state.kv_a_width, f.rank, world, true);
+            try k.mla.prep(s, ws.kv, a.kv_a_norm, cos, sin, positions_at, cache_latent, cache_rope, cache_stage, rows, state.kv_a_width, f.dcpRank(), f.dcpWorld(), true);
             try f.profileSubEnd(mode, plane, .attn_pre_kv_a_norm_rope);
             if (a.indexer) |ix| {
                 const cache_index_plane = f.st.indexAt(ordinal);
@@ -2279,10 +2302,10 @@ pub const Forward = struct {
                 try f.project(mode, s, xn, hidden, rows, ix.wk, ws.ik, .bf16, ws.lane_part);
                 try f.profileSubEnd(mode, plane, .attn_pre_indexer_key_proj);
                 try f.profileSubBegin(mode, plane, .attn_pre_indexer_keys_write);
-                try k.index.keys(s, ws.ik, ix.k_norm, ix.k_bias, cos, sin, positions_at, cache_index_plane, rows, index.dim, 0, f.rank, world, f.w.config.indexer_eps);
+                try k.index.keys(s, ws.ik, ix.k_norm, ix.k_bias, cos, sin, positions_at, cache_index_plane, rows, index.dim, 0, f.dcpRank(), f.dcpWorld(), f.w.config.indexer_eps);
                 try f.profileSubEnd(mode, plane, .attn_pre_indexer_keys_write);
             }
-            if (f.prefetch) |pf| {
+            if (f.activePrefetch()) |pf| {
                 const cache_pair = plane % state.stage_pairs;
                 if (p.start == 0) try s.wait(pf.fetched[cache_pair]);
                 if (p.end == positions.len) try pf.attended[cache_pair].record(s);
@@ -2353,10 +2376,10 @@ pub const Forward = struct {
         const rope = f.st.ropeAt(plane);
         const b = plane % state.stage_pairs;
         // The shared StagePlanes pair of this layer (types.zig contract); decode passes none.
-        const stage: ?types.StagePlanePair = if (prefill) f.st.stage.forLayer(plane).* else null;
+        const stage: ?types.StagePlanePair = if (prefill and f.dcpWorld() > 1) f.st.stage.forLayer(plane).* else null;
         if (!skip_cache) {
             try f.profileSubBeginStream(mode, plane, .attn_pre_kv_a_norm_rope, if (side_on) side else s);
-            try k.mla.prep(if (side_on) side else s, ws.kv, a.kv_a_norm, cos, sin, positions_at, latent, rope, stage, rows, state.kv_a_width, f.rank, world, prefill);
+            try k.mla.prep(if (side_on) side else s, ws.kv, a.kv_a_norm, cos, sin, positions_at, latent, rope, stage, rows, state.kv_a_width, f.dcpRank(), f.dcpWorld(), prefill);
             try f.profileSubEndStream(mode, plane, .attn_pre_kv_a_norm_rope, if (side_on) side else s);
         }
         if (a.indexer) |ix| {
@@ -2370,7 +2393,7 @@ pub const Forward = struct {
                         try f.profileSubEndStream(mode, plane, .attn_pre_indexer_key_proj, side);
                     }
                     try f.profileSubBeginStream(mode, plane, .attn_pre_indexer_keys_write, side);
-                    try k.index.keys(side, ws.ik, ix.k_norm, ix.k_bias, cos, sin, positions_at, iplane, rows, index.dim, 0, f.rank, world, f.w.config.indexer_eps);
+                    try k.index.keys(side, ws.ik, ix.k_norm, ix.k_bias, cos, sin, positions_at, iplane, rows, index.dim, 0, f.dcpRank(), f.dcpWorld(), f.w.config.indexer_eps);
                     try f.profileSubEndStream(mode, plane, .attn_pre_indexer_keys_write, side);
                     try (f.st.kv orelse return error.MissingDecodeSideEvents).record(side);
                     try s.wait(f.st.kv.?);
@@ -2381,7 +2404,7 @@ pub const Forward = struct {
                         try f.profileSubEnd(mode, plane, .attn_pre_indexer_key_proj);
                     }
                     try f.profileSubBegin(mode, plane, .attn_pre_indexer_keys_write);
-                    try k.index.keys(s, ws.ik, ix.k_norm, ix.k_bias, cos, sin, positions_at, iplane, rows, index.dim, 0, f.rank, world, f.w.config.indexer_eps);
+                    try k.index.keys(s, ws.ik, ix.k_norm, ix.k_bias, cos, sin, positions_at, iplane, rows, index.dim, 0, f.dcpRank(), f.dcpWorld(), f.w.config.indexer_eps);
                     try f.profileSubEnd(mode, plane, .attn_pre_indexer_keys_write);
                 }
             }
@@ -2404,23 +2427,23 @@ pub const Forward = struct {
         // kv_b holds this rank's heads only, so the MLA kernels index it with local heads: head0 = 0 (kvbLocalHead0).
         const kvb_head0 = 0;
         const prompt_mla = if (prefill) f.promptMlaMode() else .off;
-        const qa_bytes = rows * state.local_heads * mla.latent_dim * 2;
-        const qpe_bytes = rows * state.local_heads * mla.rope_dim * 2;
+        const qa_bytes = rows * a.local_heads * mla.latent_dim * 2;
+        const qpe_bytes = rows * a.local_heads * mla.rope_dim * 2;
         const qa = if (prefill) ws.qa else ws.qa + f.rank * qa_bytes;
         const qpe = if (prefill) ws.qpe else ws.qpe + f.rank * qpe_bytes;
         try f.profileSubBegin(mode, plane, .attn_pre_q_pe_pack);
-        try k.mla.packQpe(s, ws.q, cos, sin, qpe, rows, state.local_heads);
+        try k.mla.packQpe(s, ws.q, cos, sin, qpe, rows, a.local_heads);
         try f.profileSubEnd(mode, plane, .attn_pre_q_pe_pack);
 
         // 12/16-row copy rounds (TF_GLM53_VERIFY_MAX=16) exceed the decode MLA kernels' 8 rows: they use the generic kernels.
         const use_decode_mla = mode == .decode and rows <= mla.max_decode_rows and f.decodeMlaEnabled();
         try f.profileSubBegin(mode, plane, .attn_pre_absorb);
         if (prefill and prompt_mla != .off) {
-            try k.mla.absorbPrompt(s, ws.q, a.kv_b.codes, a.kv_b.scales, qa, rows, state.local_heads, kvb_head0, prompt_mla);
+            try k.mla.absorbPrompt(s, ws.q, a.kv_b.codes, a.kv_b.scales, qa, rows, a.local_heads, kvb_head0, prompt_mla);
         } else if (use_decode_mla and f.decodeMlaV3Enabled()) {
-            try k.mla.absorbV3(s, ws.q, a.kv_b.codes, a.kv_b.scales, qa, rows, state.local_heads, kvb_head0);
+            try k.mla.absorbV3(s, ws.q, a.kv_b.codes, a.kv_b.scales, qa, rows, a.local_heads, kvb_head0);
         } else {
-            try k.mla.absorb(s, ws.q, a.kv_b.codes, a.kv_b.scales, qa, rows, state.local_heads, kvb_head0, use_decode_mla);
+            try k.mla.absorb(s, ws.q, a.kv_b.codes, a.kv_b.scales, qa, rows, a.local_heads, kvb_head0, use_decode_mla);
         }
         try f.profileSubEnd(mode, plane, .attn_pre_absorb);
 
@@ -2431,12 +2454,12 @@ pub const Forward = struct {
             if (f.smlaPEnabled()) {
                 try f.profileSubBegin(mode, plane, .attn_pre_smla_p_scores);
                 if (f.smla_p3) {
-                    try k.mla.attendSmlaP3(s, ws.qa, ws.qpe, latent, rope, stage, positions_at, tokens, ws.local_slots, counts, ws.local_counts, dense_len, ws.part, rows, state.local_heads, f.rank, world, ws.smla_union, ws.sizes.smla_union);
+                    try k.mla.attendSmlaP3(s, ws.qa, ws.qpe, latent, rope, stage, positions_at, tokens, ws.local_slots, counts, ws.local_counts, dense_len, ws.part, rows, a.local_heads, f.dcpRank(), f.dcpWorld(), ws.smla_union, ws.sizes.smla_union);
                 } else if (f.smlaFp8Enabled()) {
-                    try k.mla.attendSmlaPFp8(s, ws.qa, ws.qpe, latent, rope, stage, positions_at, tokens, ws.local_slots, counts, ws.local_counts, dense_len, ws.part, rows, state.local_heads, f.rank, world);
-                } else try k.mla.attendSmlaP(s, ws.qa, ws.qpe, latent, rope, stage, positions_at, tokens, ws.local_slots, counts, ws.local_counts, dense_len, ws.part, rows, state.local_heads, f.rank, world);
+                    try k.mla.attendSmlaPFp8(s, ws.qa, ws.qpe, latent, rope, stage, positions_at, tokens, ws.local_slots, counts, ws.local_counts, dense_len, ws.part, rows, a.local_heads, f.dcpRank(), f.dcpWorld());
+                } else try k.mla.attendSmlaP(s, ws.qa, ws.qpe, latent, rope, stage, positions_at, tokens, ws.local_slots, counts, ws.local_counts, dense_len, ws.part, rows, a.local_heads, f.dcpRank(), f.dcpWorld());
                 try f.profileSubEnd(mode, plane, .attn_pre_smla_p_scores);
-            } else try k.mla.attend(s, ws.qa, ws.qpe, latent, rope, stage, positions_at, tokens, ws.local_slots, counts, ws.local_counts, dense_len, ws.part, rows, state.local_heads, f.rank, world, true, 0);
+            } else try k.mla.attend(s, ws.qa, ws.qpe, latent, rope, stage, positions_at, tokens, ws.local_slots, counts, ws.local_counts, dense_len, ws.part, rows, a.local_heads, f.dcpRank(), f.dcpWorld(), true, 0);
             if (f.activePrefetch()) |pf| if (p.end == positions.len) {
                 try pf.attended[b].record(s);
                 if (next) |n| try f.prefetchLayer(n, positions[0]);
@@ -2445,11 +2468,25 @@ pub const Forward = struct {
             try f.profileBegin(mode, plane, .expand_v);
 
             if (prompt_mla != .off) {
-                try k.mla.expandVPrompt(s, ws.part, a.kv_b.codes, a.kv_b.scales, ws.vo, rows, state.local_heads, kvb_head0, prompt_mla);
+                try k.mla.expandVPrompt(s, ws.part, a.kv_b.codes, a.kv_b.scales, ws.vo, rows, a.local_heads, kvb_head0, prompt_mla);
             } else {
-                try k.mla.expandV(s, ws.part, a.kv_b.codes, a.kv_b.scales, ws.vo, rows, state.local_heads, kvb_head0, false);
+                try k.mla.expandV(s, ws.part, a.kv_b.codes, a.kv_b.scales, ws.vo, rows, a.local_heads, kvb_head0, false);
             }
 
+            try f.profileEnd(mode, plane, .expand_v);
+        } else if (f.st.world == 3) {
+            // TP=3 Replicated KV (dcp=1): No query gathering, no peer exchange, no LSE merge.
+            // Each rank attends its own local heads directly against local KV cache into ws.ol.
+            try f.profileEnd(mode, plane, .attn_pre);
+            try f.profileBegin(mode, plane, .attn_pre);
+            try k.mla.attend(s, qa, qpe, latent, rope, null, positions_at, tokens, ws.local_slots, counts, ws.local_counts, dense_len, ws.ol, rows, a.local_heads, 0, 1, false, ws.attend_split);
+            try f.profileEnd(mode, plane, .attn_pre);
+            try f.profileBegin(mode, plane, .expand_v);
+            if (use_decode_mla and f.decodeMlaV2Enabled()) {
+                try k.mla.expandVV2(s, ws.ol, a.kv_b.codes, a.kv_b.scales, ws.vo, rows, a.local_heads, kvb_head0);
+            } else {
+                try k.mla.expandV(s, ws.ol, a.kv_b.codes, a.kv_b.scales, ws.vo, rows, a.local_heads, kvb_head0, use_decode_mla);
+            }
             try f.profileEnd(mode, plane, .expand_v);
         } else {
             try f.profileEnd(mode, plane, .attn_pre);
@@ -2505,7 +2542,7 @@ pub const Forward = struct {
             try f.profileEnd(mode, plane, .expand_v);
         }
         try f.profileBegin(mode, plane, .attn_post);
-        const vo_width = state.local_heads * mla.value_dim;
+        const vo_width = a.local_heads * mla.value_dim;
         const output = if (pipe_slot) |ring_slot| ws.pipe_src[ring_slot] else f.slot(rows);
         if (prefill and f.prefill_w8a8) {
             try f.oProjW8a8(s, ws.vo, vo_width, rows, a.o_proj, output);
@@ -2532,7 +2569,7 @@ pub const Forward = struct {
         const top = positions[rows - 1];
         // Decode scores a whole key bucket (masked past each row's position), so a decode graph replays across
         // positions inside its bucket; prefill scores exactly the keys below the piece's last row.
-        const nkeys = if (mode == .decode) @min(decodeKeyBucket(top) / world, ws.index_slots) else if (top >= f.rank) (top - f.rank) / world + 1 else 0;
+        const nkeys = if (mode == .decode) @min(decodeKeyBucket(top) / f.dcpWorld(), ws.index_slots) else if (top >= f.dcpRank()) (top - f.dcpRank()) / f.dcpWorld() + 1 else 0;
         if (nkeys == 0 or nkeys > ws.index_slots or nkeys > index.max_local_keys) return error.IndexCapacity;
         var at: usize = 0;
         while (at < rows) : (at += ws.score_rows) {
@@ -2540,26 +2577,36 @@ pub const Forward = struct {
             if (!sparseIn(positions[at..][0..n])) continue;
             const pos = ws.positions + (lo + at) * 8;
             try f.profileSubBegin(mode, layer, .attn_pre_indexer_scoring);
-            try index_k.scores(s, ws.qi + at * index.heads * index.dim * 2, ws.iw + at * index.heads * 2, index.heads, 0, plane, pos, ws.scores, n, nkeys, nkeys, f.rank, world);
+            try index_k.scores(s, ws.qi + at * index.heads * index.dim * 2, ws.iw + at * index.heads * 2, index.heads, 0, plane, pos, ws.scores, n, nkeys, nkeys, f.dcpRank(), f.dcpWorld());
             try f.profileSubEnd(mode, layer, .attn_pre_indexer_scoring);
             try f.profileSubBegin(mode, layer, .attn_pre_indexer_topk);
-            try k.index.topk(s, ws.scores, nkeys, ws.topk_tokens, ws.topk_counts, ws.candidate_records, pos, n, nkeys, index.top_k, f.rank, world);
+            try k.index.topk(s, ws.scores, nkeys, ws.topk_tokens, ws.topk_counts, ws.candidate_records, pos, n, nkeys, index.top_k, f.dcpRank(), f.dcpWorld());
             try f.profileSubEnd(mode, layer, .attn_pre_indexer_topk);
-            const bytes = n * index.top_k * 8;
-            try f.profileEnd(mode, layer, .attn_pre);
-            try f.profileBegin(mode, layer, .attn_comm);
-            try f.profileSubBegin(mode, layer, .attn_pre_indexer_gather);
-            try f.coll.allGather(s, ws.candidate_records, ws.gathered_candidates, bytes, .index_candidates);
-            try f.profileSubEnd(mode, layer, .attn_pre_indexer_gather);
-            try f.profileEnd(mode, layer, .attn_comm);
-            try f.profileBegin(mode, layer, .attn_pre);
-            try f.profileSubBegin(mode, layer, .attn_pre_indexer_merge);
-            if (f.index_merge == 2) {
-                try k.index.merge2(s, ws.gathered_candidates, ws.global_tokens + (lo + at) * index.top_k * 4, ws.global_counts + (lo + at) * 4, ws.local_slots + (lo + at) * index.top_k * 4, ws.local_counts + (lo + at) * 4, pos, f.rank, world, n, index.top_k, n);
+            if (f.dcpWorld() == 1) {
+                try f.profileSubBegin(mode, layer, .attn_pre_indexer_merge);
+                if (f.index_merge == 2) {
+                    try k.index.merge2(s, ws.candidate_records, ws.global_tokens + (lo + at) * index.top_k * 4, ws.global_counts + (lo + at) * 4, ws.local_slots + (lo + at) * index.top_k * 4, ws.local_counts + (lo + at) * 4, pos, 0, 1, n, index.top_k, n);
+                } else {
+                    try k.index.merge(s, ws.candidate_records, ws.global_tokens + (lo + at) * index.top_k * 4, ws.global_counts + (lo + at) * 4, ws.local_slots + (lo + at) * index.top_k * 4, ws.local_counts + (lo + at) * 4, pos, 0, 1, n, index.top_k);
+                }
+                try f.profileSubEnd(mode, layer, .attn_pre_indexer_merge);
             } else {
-                try k.index.merge(s, ws.gathered_candidates, ws.global_tokens + (lo + at) * index.top_k * 4, ws.global_counts + (lo + at) * 4, ws.local_slots + (lo + at) * index.top_k * 4, ws.local_counts + (lo + at) * 4, pos, f.rank, world, n, index.top_k);
+                const bytes = n * index.top_k * 8;
+                try f.profileEnd(mode, layer, .attn_pre);
+                try f.profileBegin(mode, layer, .attn_comm);
+                try f.profileSubBegin(mode, layer, .attn_pre_indexer_gather);
+                try f.coll.allGather(s, ws.candidate_records, ws.gathered_candidates, bytes, .index_candidates);
+                try f.profileSubEnd(mode, layer, .attn_pre_indexer_gather);
+                try f.profileEnd(mode, layer, .attn_comm);
+                try f.profileBegin(mode, layer, .attn_pre);
+                try f.profileSubBegin(mode, layer, .attn_pre_indexer_merge);
+                if (f.index_merge == 2) {
+                    try k.index.merge2(s, ws.gathered_candidates, ws.global_tokens + (lo + at) * index.top_k * 4, ws.global_counts + (lo + at) * 4, ws.local_slots + (lo + at) * index.top_k * 4, ws.local_counts + (lo + at) * 4, pos, f.dcpRank(), f.dcpWorld(), n, index.top_k, n);
+                } else {
+                    try k.index.merge(s, ws.gathered_candidates, ws.global_tokens + (lo + at) * index.top_k * 4, ws.global_counts + (lo + at) * 4, ws.local_slots + (lo + at) * index.top_k * 4, ws.local_counts + (lo + at) * 4, pos, f.dcpRank(), f.dcpWorld(), n, index.top_k);
+                }
+                try f.profileSubEnd(mode, layer, .attn_pre_indexer_merge);
             }
-            try f.profileSubEnd(mode, layer, .attn_pre_indexer_merge);
         }
     }
 
@@ -2573,7 +2620,7 @@ pub const Forward = struct {
         const rows = positions.len;
         if (rows > ws.piece_rows) return error.IndexPipeRows;
         const top = positions[rows - 1];
-        const nkeys = if (top >= f.rank) (top - f.rank) / world + 1 else 0;
+        const nkeys = if (top >= f.dcpRank()) (top - f.dcpRank()) / f.dcpWorld() + 1 else 0;
         if (nkeys == 0 or nkeys > ws.index_slots or nkeys > index.max_local_keys) return error.IndexCapacity;
         if (!sparseIn(positions)) return;
         const blocks = (rows + ws.score_rows - 1) / ws.score_rows;
@@ -2592,12 +2639,12 @@ pub const Forward = struct {
             }
             const pos = ws.positions + (lo + at) * 8;
             const mine = ws.candidate_records + block * ws.score_rows * index.top_k * 8;
-            const gathered = ws.gathered_candidates + block * 2 * ws.score_rows * index.top_k * 8;
+            const gathered = ws.gathered_candidates + block * f.dcpWorld() * ws.score_rows * index.top_k * 8;
             try f.profileSubBegin(mode, layer, .attn_pre_indexer_scoring);
-            try index_k.scores(main, ws.qi + at * index.heads * index.dim * 2, ws.iw + at * index.heads * 2, index.heads, 0, plane, pos, ws.scores, n, nkeys, nkeys, f.rank, world);
+            try index_k.scores(main, ws.qi + at * index.heads * index.dim * 2, ws.iw + at * index.heads * 2, index.heads, 0, plane, pos, ws.scores, n, nkeys, nkeys, f.dcpRank(), f.dcpWorld());
             try f.profileSubEnd(mode, layer, .attn_pre_indexer_scoring);
             try f.profileSubBegin(mode, layer, .attn_pre_indexer_topk);
-            try k.index.topk(main, ws.scores, nkeys, ws.topk_tokens, ws.topk_counts, mine, pos, n, nkeys, index.top_k, f.rank, world);
+            try k.index.topk(main, ws.scores, nkeys, ws.topk_tokens, ws.topk_counts, mine, pos, n, nkeys, index.top_k, f.dcpRank(), f.dcpWorld());
             try f.profileSubEnd(mode, layer, .attn_pre_indexer_topk);
             const ready = try wsEvent(f.st.index_pipe_ready[block]);
             try ready.record(main);
@@ -2614,7 +2661,7 @@ pub const Forward = struct {
         try f.profileBegin(mode, layer, .attn_pre);
         try f.profileSubBegin(mode, layer, .attn_pre_indexer_merge);
         const skipped_rows = b0 * ws.score_rows;
-        try k.index.merge2(main, ws.gathered_candidates + b0 * 2 * ws.score_rows * index.top_k * 8, ws.global_tokens + (lo + skipped_rows) * index.top_k * 4, ws.global_counts + (lo + skipped_rows) * 4, ws.local_slots + (lo + skipped_rows) * index.top_k * 4, ws.local_counts + (lo + skipped_rows) * 4, ws.positions + (lo + skipped_rows) * 8, f.rank, world, rows - skipped_rows, index.top_k, ws.score_rows);
+        try k.index.merge2(main, ws.gathered_candidates + b0 * f.dcpWorld() * ws.score_rows * index.top_k * 8, ws.global_tokens + (lo + skipped_rows) * index.top_k * 4, ws.global_counts + (lo + skipped_rows) * 4, ws.local_slots + (lo + skipped_rows) * index.top_k * 4, ws.local_counts + (lo + skipped_rows) * 4, ws.positions + (lo + skipped_rows) * 8, f.dcpRank(), f.dcpWorld(), rows - skipped_rows, index.top_k, ws.score_rows);
         try f.profileSubEnd(mode, layer, .attn_pre_indexer_merge);
     }
 
@@ -2688,7 +2735,7 @@ pub const Forward = struct {
                 const ring_slot = if (f.moePipeEnabled()) piece_ordinal % ws.moe_pipe_slots else 0;
                 if (f.moePipeEnabled() and moe_slot_used[ring_slot]) try f.stream.wait(f.st.moe_pipe_done[ring_slot].?);
                 if (f.moePipeEnabled()) moe_slot_used[ring_slot] = true;
-                const gathered_bytes = n * hidden * world * 2;
+                const gathered_bytes = n * hidden * f.st.world * 2;
                 const moe_out = if (f.moe_post) ws.moe_pipe_gather[ring_slot] + f.rank * n * hidden * 2 else if (f.moePipeEnabled()) ws.moe_pipe_src[ring_slot] else f.gatherBuffer() + gathered_bytes;
                 var legacy_lowrank_k = f.k.glue53;
                 legacy_lowrank_k.decode_fast = false;
@@ -2743,14 +2790,14 @@ pub const Forward = struct {
         switch (l.ffn) {
             .dense => |d| {
                 try f.profileBegin(mode, l.index, .dense_mlp);
-                try mlp.block(mlp_k, s, d, scratch, xn, n, mlp.dense_width, out);
+                try mlp.block(mlp_k, s, d, scratch, xn, n, d.down.k, out);
             },
             .moe => |m| {
                 var routed: Routed = .{ .f = f, .layer = m.routed, .mode = mode };
                 const lr: ?moe.LowRankWeights = if (m.lowrank) |r| .{ .a = r.a, .b = r.b, .mid = ws.lowrank_mid, .rank_local = r.rank_local } else null;
                 if (m.lowrank) |r| if (r.rank_local > state.lowrank_max) return error.LowRankTooWide;
                 // The BF16 partial lives after this piece's rank-major all-gather span; router_logits is too small.
-                const gathered_bytes = n * hidden * world * 2;
+                const gathered_bytes = n * hidden * f.st.world * 2;
                 const moe_out = f.gatherBuffer() + gathered_bytes;
                 // The routed fp32 output is never all-gathered, so it sits at the start of ws.gathered on EVERY rank:
                 // f.slot(n) put rank 1's at gathered + 4*n*hidden, the same address as moe_out, and the combine kernel
@@ -2765,7 +2812,7 @@ pub const Forward = struct {
                     // pick, expert and routed-output regions, which are disjoint from gate_up/activation/lane_part.
                     try moe.route(k.router(), s, xn, hidden, m.router, m.bias, ws.router_logits, ws.router_part, ws.picks, ws.wts, n);
                     try runRouted(&routed, s, xn, hidden, ws.picks, ws.wts, n, routed_out);
-                    try mlp.block(mlp_k, side, m.shared, scratch, xn, n, mlp.shared_width, ws.shared_out);
+                    try mlp.block(mlp_k, side, m.shared, scratch, xn, n, m.shared.down.k, ws.shared_out);
                     // The low-rank partial/reduce that moe.block runs (review of 2b9a090e: without it blockPost combined
                     // stale lowrank_mid). lowrank_mid is disjoint from the main route/expert scratch.
                     var lowrank_k = k.glue53;
@@ -3179,4 +3226,38 @@ test "force semantic analysis of every forward declaration" {
     std.testing.refAllDecls(RowInputs);
     std.testing.refAllDecls(RowInputs.DecodeStorage);
     std.testing.refAllDecls(Forward);
+}
+
+test "embedRowFor TP3 boundary tokens" {
+    // Rank 0 (vocab_local = 51712): tokens 0..51711
+    const r0_t0 = embedRowFor(0, 0, 51712);
+    try std.testing.expectEqual(@as(i32, 0), r0_t0.owner);
+    try std.testing.expectEqual(@as(i32, 0), r0_t0.local);
+
+    const r0_last = embedRowFor(51711, 0, 51712);
+    try std.testing.expectEqual(@as(i32, 0), r0_last.owner);
+    try std.testing.expectEqual(@as(i32, 51711), r0_last.local);
+
+    // Rank 1 (vocab_local = 51584): tokens 51712..103295
+    const r1_first = embedRowFor(51712, 1, 51584);
+    try std.testing.expectEqual(@as(i32, 1), r1_first.owner);
+    try std.testing.expectEqual(@as(i32, 0), r1_first.local);
+
+    const r1_last = embedRowFor(103295, 1, 51584);
+    try std.testing.expectEqual(@as(i32, 1), r1_last.owner);
+    try std.testing.expectEqual(@as(i32, 51583), r1_last.local);
+
+    // Rank 2 (vocab_local = 51584): tokens 103296..154879
+    const r2_first = embedRowFor(103296, 2, 51584);
+    try std.testing.expectEqual(@as(i32, 2), r2_first.owner);
+    try std.testing.expectEqual(@as(i32, 0), r2_first.local);
+
+    const r2_last = embedRowFor(154879, 2, 51584);
+    try std.testing.expectEqual(@as(i32, 2), r2_last.owner);
+    try std.testing.expectEqual(@as(i32, 51583), r2_last.local);
+
+    // Token owned by another rank gives local 0
+    const r0_on_r1 = embedRowFor(51712, 0, 51712);
+    try std.testing.expectEqual(@as(i32, 1), r0_on_r1.owner);
+    try std.testing.expectEqual(@as(i32, 0), r0_on_r1.local);
 }

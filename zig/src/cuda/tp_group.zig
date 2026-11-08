@@ -7,6 +7,7 @@ const driver = @import("driver.zig");
 const stream_ = @import("stream.zig");
 const memory = @import("memory.zig");
 const roce = @import("roce.zig");
+const abi = @import("abi.zig");
 
 const Stream = stream_.Stream;
 
@@ -300,7 +301,7 @@ test "setup handshakes take NCCL even when RoCE would fit" {
     };
     var gat: roce.Gather = undefined;
     gat.max_bytes = 4 << 20;
-    gat.stream_handle = @ptrFromInt(0x1000);
+    gat.stream_handle = @as(abi.Stream, @ptrFromInt(0x1000));
     gat.gathers = 0;
     var group: Group = .{ .lib = undefined, .comm = null, .rank = 0, .world = 2 };
     group.fast = &gat;
@@ -367,7 +368,7 @@ test "allGather routes fitting off-stream payloads through NCCL and counts the r
     };
     var gat: roce.Gather = undefined;
     gat.max_bytes = 4 << 20;
-    gat.stream_handle = @ptrFromInt(0x1000);
+    gat.stream_handle = @as(abi.Stream, @ptrFromInt(0x1000));
     var group: Group = .{ .lib = undefined, .comm = null, .rank = 0, .world = 2, .fast = &gat, .gather_roce = true };
     group.lib.api.ncclAllGather = Fake.allGather;
     const other: Stream = .{ .d = undefined, .handle = @ptrFromInt(0x2000) };

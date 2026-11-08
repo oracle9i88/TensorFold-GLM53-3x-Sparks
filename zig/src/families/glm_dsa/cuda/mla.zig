@@ -53,9 +53,13 @@ pub const AttendKernel = enum { scalar, mma };
 pub const decode_split_tiles = 4;
 pub const decode_splits = 2048 / 16 / decode_split_tiles;
 
+pub fn headGroups(local_heads: usize) usize {
+    return (local_heads + 31) / 32;
+}
+
 /// The decode split workspace: [groups][rows][splits][32 heads][latent + max + denominator] fp32.
 pub fn splitWorkspaceBytes(rows: usize, local_heads: usize) u64 {
-    return @as(u64, rows) * (local_heads / 32) * decode_splits * 32 * (latent_dim + 2) * 4;
+    return @as(u64, rows) * headGroups(local_heads) * decode_splits * 32 * (latent_dim + 2) * 4;
 }
 
 pub const attend_mma_smem: u32 = 32 * 584 * 2 + 2 * 16 * 584 * 2 + 2 * 32 * 16 * 4 + 32 * 24 * 2 + 3 * 32 * 4 + 4 * 16 * 4;
@@ -74,8 +78,8 @@ pub fn splitBusy(local_keys: usize, split: usize) bool {
 
 pub fn attendVerifyPlan(rows: usize, local_heads: usize) !Plan {
     if (rows == 0 or rows > verify_max_rows) return error.DecodeMlaRows;
-    if (local_heads == 0 or local_heads % 32 != 0) return error.AttendShape;
-    return .{ .grid = .{ @intCast(rows), @intCast(local_heads / 32), decode_verify_chunks }, .block = 256, .dynamic_smem = attend_verify_smem };
+    if (local_heads == 0 or (local_heads > 32 and local_heads % 32 != 0) or (local_heads < 32 and local_heads % 2 != 0)) return error.AttendShape;
+    return .{ .grid = .{ @intCast(rows), @intCast(headGroups(local_heads)), decode_verify_chunks }, .block = 256, .dynamic_smem = attend_verify_smem };
 }
 
 /// tf_glm53_smla_p (mla.cu SMLA_*, TF_GLM53_SMLA_P=1): the prefill attend with query blocking. A block takes
@@ -130,14 +134,14 @@ pub fn smlaPFp8Plan(rows: usize, local_heads: usize) !Plan {
 }
 
 pub fn smlaPPlan(rows: usize, local_heads: usize) !Plan {
-    if (local_heads % 32 != 0) return error.AttendShape;
-    return .{ .grid = .{ @intCast((rows + smla_p_rows - 1) / smla_p_rows), @intCast(local_heads / 32), 1 }, .block = smla_p_threads, .dynamic_smem = smla_p_smem };
+    if (local_heads == 0 or (local_heads > 32 and local_heads % 32 != 0) or (local_heads < 32 and local_heads % 2 != 0)) return error.AttendShape;
+    return .{ .grid = .{ @intCast((rows + smla_p_rows - 1) / smla_p_rows), @intCast(headGroups(local_heads)), 1 }, .block = smla_p_threads, .dynamic_smem = smla_p_smem };
 }
 
 pub fn attendPlan(rows: usize, local_heads: usize, prefill: bool, kernel: AttendKernel) !Plan {
     _ = prefill;
-    if (kernel == .mma and local_heads % 32 != 0) return error.AttendShape;
-    return .{ .grid = .{ @intCast(rows), @intCast(if (kernel == .mma) local_heads / 32 else local_heads), 1 }, .block = 256, .dynamic_smem = if (kernel == .mma) attend_mma_smem else 0 };
+    if (kernel == .mma and (local_heads == 0 or (local_heads > 32 and local_heads % 32 != 0) or (local_heads < 32 and local_heads % 2 != 0))) return error.AttendShape;
+    return .{ .grid = .{ @intCast(rows), @intCast(if (kernel == .mma) headGroups(local_heads) else local_heads), 1 }, .block = 256, .dynamic_smem = if (kernel == .mma) attend_mma_smem else 0 };
 }
 
 /// The scalar MLA kernel maps one block to one complete head for decode and prefill.
@@ -184,6 +188,12 @@ test "decode verify plan: 16 chunks of 2 splits, attend_mma smem + slot table, r
     try std.testing.expectEqual(2 * splitWorkspaceBytes(8, 64), splitWorkspaceBytes(16, 64));
     try std.testing.expectEqual(@as(u64, 67_371_008), splitWorkspaceBytes(16, 64));
     try std.testing.expectEqual(@as(u32, 1), (try attendVerifyPlan(3, 32)).grid[1]);
+    try std.testing.expectEqual(@as(u32, 1), (try attendVerifyPlan(3, 22)).grid[1]);
+    try std.testing.expectEqual(@as(u32, 1), (try attendVerifyPlan(3, 20)).grid[1]);
+    try std.testing.expectEqual(@as(u32, 1), (try smlaPPlan(3, 22)).grid[1]);
+    try std.testing.expectEqual(@as(u32, 1), (try smlaPPlan(3, 20)).grid[1]);
+    try std.testing.expectEqual(@as(u64, 33_685_504), splitWorkspaceBytes(16, 22));
+    try std.testing.expectEqual(@as(u64, 33_685_504), splitWorkspaceBytes(16, 20));
     try std.testing.expectError(error.DecodeMlaRows, attendVerifyPlan(0, 64));
     try std.testing.expectError(error.DecodeMlaRows, attendVerifyPlan(17, 64));
     for ([_]usize{ 31, 48, 0 }) |h| try std.testing.expectError(error.AttendShape, attendVerifyPlan(1, h));
@@ -215,12 +225,12 @@ pub fn useMaskedMha(position: usize, switch_point: usize) bool {
     return position < switch_point;
 }
 
-fn validateAttendStage(prefill: bool, stage_latent: u64, stage_rope: u64) !void {
-    try validateKvWriteStage(prefill, stage_latent, stage_rope);
+fn validateAttendStage(world: usize, prefill: bool, stage_latent: u64, stage_rope: u64) !void {
+    try validateKvWriteStage(world, prefill, stage_latent, stage_rope);
 }
 
-fn validateKvWriteStage(prefill: bool, stage_latent: u64, stage_rope: u64) !void {
-    if (prefill and (stage_latent == 0 or stage_rope == 0)) return error.MissingPrefillStage;
+fn validateKvWriteStage(world: usize, prefill: bool, stage_latent: u64, stage_rope: u64) !void {
+    if (world > 1 and prefill and (stage_latent == 0 or stage_rope == 0)) return error.MissingPrefillStage;
     if ((stage_latent == 0) != (stage_rope == 0)) return error.InvalidStagePair;
 }
 
@@ -576,7 +586,7 @@ pub const Mla = struct {
         if (rows == 0) return;
         if (world == 0 or rank >= world or stride < latent_dim + rope_dim) return error.KvWriteShape;
         const stage_ptrs = stagePointers(stage);
-        try validateKvWriteStage(prefill, stage_ptrs.latent, stage_ptrs.rope);
+        try validateKvWriteStage(world, prefill, stage_ptrs.latent, stage_ptrs.rope);
         var a: cuda.Args = .{};
         inline for (.{ proj, norm, cos, sin, positions, latent, rope, stage_ptrs.latent, stage_ptrs.rope, @as(i32, @intCast(rows)), @as(i32, @intCast(stride)), @as(i32, @intCast(rank)), @as(i32, @intCast(world)) }) |v| a.add(v);
         try cuda.launch.launch(m.prep_fn, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 128 } }, stream, &a);
@@ -632,7 +642,7 @@ pub const Mla = struct {
         if (rows == 0) return;
         if (world == 0 or rank >= world) return error.DcpShape;
         const stage_ptrs = stagePointers(stage);
-        try validateAttendStage(prefill, stage_ptrs.latent, stage_ptrs.rope);
+        try validateAttendStage(world, prefill, stage_ptrs.latent, stage_ptrs.rope);
         try validateAttendHeads(prefill, local_heads);
         const p = try attendPlan(rows, local_heads, prefill, m.attend_kernel);
         var a: cuda.Args = .{};
@@ -689,7 +699,7 @@ pub const Mla = struct {
         const p3_fn = m.smla_p3_fn orelse return error.MissingSmlaP3Kernels;
         if (table == 0 or table % 16 != 0 or table_bytes < smlaP3TableBytes(rows)) return error.SmlaP3Table;
         const stage_ptrs = stagePointers(stage);
-        try validateAttendStage(true, stage_ptrs.latent, stage_ptrs.rope);
+        try validateAttendStage(world, true, stage_ptrs.latent, stage_ptrs.rope);
         try validateAttendHeads(true, local_heads);
         const u = smlaUnionPlan(rows);
         var ua: cuda.Args = .{};
@@ -705,7 +715,7 @@ pub const Mla = struct {
         if (rows == 0) return;
         if (world == 0 or rank >= world) return error.DcpShape;
         const stage_ptrs = stagePointers(stage);
-        try validateAttendStage(true, stage_ptrs.latent, stage_ptrs.rope);
+        try validateAttendStage(world, true, stage_ptrs.latent, stage_ptrs.rope);
         try validateAttendHeads(true, local_heads);
         const p = if (fp8) try smlaPFp8Plan(rows, local_heads) else try smlaPPlan(rows, local_heads);
         var a: cuda.Args = .{};
@@ -926,16 +936,18 @@ test "gather-on-prefill dense MLA follows kernel owner and staging indices throu
 }
 
 test "prefill attention rejects either missing staging plane" {
-    try std.testing.expectError(error.MissingPrefillStage, validateAttendStage(true, 1, 0));
-    try std.testing.expectError(error.MissingPrefillStage, validateAttendStage(true, 0, 1));
-    try validateAttendStage(true, 1, 1);
-    try validateAttendStage(false, 0, 0);
+    try std.testing.expectError(error.MissingPrefillStage, validateAttendStage(2, true, 1, 0));
+    try std.testing.expectError(error.MissingPrefillStage, validateAttendStage(2, true, 0, 1));
+    try validateAttendStage(2, true, 1, 1);
+    try validateAttendStage(2, false, 0, 0);
+    try validateAttendStage(1, true, 0, 0);
 }
 
 test "prefill kv write requires paired stage planes and attend limits local head output layout" {
-    try std.testing.expectError(error.MissingPrefillStage, validateKvWriteStage(true, 0, 0));
-    try std.testing.expectError(error.InvalidStagePair, validateKvWriteStage(false, 1, 0));
-    try validateKvWriteStage(false, 0, 0);
+    try std.testing.expectError(error.MissingPrefillStage, validateKvWriteStage(2, true, 0, 0));
+    try std.testing.expectError(error.InvalidStagePair, validateKvWriteStage(2, false, 1, 0));
+    try validateKvWriteStage(2, false, 0, 0);
+    try validateKvWriteStage(1, true, 0, 0);
     try std.testing.expectError(error.PrefillHeadLimit, validateAttendHeads(true, 33));
     try validateAttendHeads(true, 32);
     try validateAttendHeads(false, 64);

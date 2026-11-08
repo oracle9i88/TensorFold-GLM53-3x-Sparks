@@ -165,7 +165,7 @@ pub fn blockWithHooks(k: Kernels, route_k: RouterKernels, mlp_k: mlp.Kernels, st
     try run_routed(routed_ctx, stream, x, x_stride, picks, weights, rows, routed_out);
     if (hooks) |h| try h.end_fn(h.ctx, 1);
     if (hooks) |h| try h.begin_fn(h.ctx, 2);
-    try mlp.block(mlp_k, stream, shared_weights, shared_scratch, x, rows, mlp.shared_width, shared_out);
+    try mlp.block(mlp_k, stream, shared_weights, shared_scratch, x, rows, shared_weights.down.k, shared_out);
     if (hooks) |h| try h.end_fn(h.ctx, 2);
     var b: u64 = 0;
     var mid: u64 = 0;
@@ -192,7 +192,7 @@ pub fn blockWithHooks(k: Kernels, route_k: RouterKernels, mlp_k: mlp.Kernels, st
 /// partial launches retain the same row shapes as `block`; the caller runs routed experts later.
 pub fn blockPre(k: Kernels, route_k: RouterKernels, mlp_k: mlp.Kernels, stream: cuda.Stream, shared_weights: mlp.Weights, shared_scratch: mlp.Scratch, x: u64, x_stride: usize, router: u64, bias: u64, logits: u64, router_part: u64, picks: u64, weights: u64, shared_out: u64, rows: usize, lowrank_weights: ?LowRankWeights) !void {
     try route(route_k, stream, x, x_stride, router, bias, logits, router_part, picks, weights, rows);
-    try mlp.block(mlp_k, stream, shared_weights, shared_scratch, x, rows, mlp.shared_width, shared_out);
+    try mlp.block(mlp_k, stream, shared_weights, shared_scratch, x, rows, shared_weights.down.k, shared_out);
     if (lowrank_weights) |lr| try lowrankPreMode(k, stream, x, x_stride, rows, lr, false);
 }
 
@@ -274,11 +274,12 @@ pub fn combineBf16Ref(routed: f32, shared: f32, low_rank: f32) u16 {
 }
 
 /// Launch the existing MoE residual boundary for rank-major BF16 partials.
-pub fn residualAddBf16(f: cuda.Function, stream: cuda.Stream, x: u64, parts: u64, rows: usize) !void {
+pub fn residualAddBf16(f: cuda.Function, stream: cuda.Stream, x: u64, parts: u64, rows: usize, world: usize) !void {
     const count = rows * hidden;
     if (rows == 0) return;
     var args: cuda.Args = .{};
-    inline for (.{ x, x, parts, @as(c_int, @intCast(count)) }) |v| args.add(v);
+    const count_arg: c_int = @intCast(count | (world << 28));
+    inline for (.{ x, x, parts, count_arg }) |v| args.add(v);
     try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast((count + 255) / 256) }, .block = .{ .x = 256 } }, stream, &args);
 }
 

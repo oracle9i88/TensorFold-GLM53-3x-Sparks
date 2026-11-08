@@ -277,7 +277,7 @@ test "the thinking budget's forced close is the same drafted, plain and shared" 
 }
 
 test "thinking budget with the long guard keeps drafted multi-row head rounds" {
-    var stats: [1]RunStats = .{};
+    var stats: [1]RunStats = .{.{}};
     const drafted = try runObserved(&.{.{ .prompt = &p2, .think_budget = 9, .loop_guard = true, .loop_guard_long = true }}, &stats);
     defer free(drafted);
     const plain = try run(&.{.{ .prompt = &p2, .think_budget = 9, .drafts = false, .loop_guard = true, .loop_guard_long = true }});

@@ -619,6 +619,7 @@ fn plain(L: *Loader, raw: []const u8, rows: ?Span, cols: ?Span, to: To) !u64 {
         .same => switch (h.dtype) {
             .bf16 => .bf16,
             .f32 => .f32,
+            .f16 => .bf16,
             else => return error.UnsupportedCheckpointDtype,
         },
     };
@@ -644,11 +645,12 @@ fn plain(L: *Loader, raw: []const u8, rows: ?Span, cols: ?Span, to: To) !u64 {
     return t_out.data.ptr;
 }
 
-/// Element `i` of a bf16/f32 tensor as bf16 bits (fp32 rounds to nearest even, as torch's cast does).
+/// Element `i` of a bf16/f32/f16 tensor as bf16 bits (fp32/fp16 rounds to nearest even, as torch's cast does).
 fn bf16Word(t: CkTensor, i: usize) !u16 {
     return switch (t.dtype) {
         .bf16 => std.mem.readInt(u16, t.bytes[i * 2 ..][0..2], .little),
         .f32 => toBf16(std.mem.bytesToValue(f32, t.bytes[i * 4 ..][0..4])),
+        .f16 => toBf16(@floatCast(@as(f16, @bitCast(std.mem.readInt(u16, t.bytes[i * 2 ..][0..2], .little))))),
         else => error.UnsupportedCheckpointDtype,
     };
 }
@@ -657,6 +659,7 @@ fn f32Value(t: CkTensor, i: usize) !f32 {
     return switch (t.dtype) {
         .bf16 => @bitCast(@as(u32, std.mem.readInt(u16, t.bytes[i * 2 ..][0..2], .little)) << 16),
         .f32 => std.mem.bytesToValue(f32, t.bytes[i * 4 ..][0..4]),
+        .f16 => @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, t.bytes[i * 2 ..][0..2], .little)))),
         else => error.UnsupportedCheckpointDtype,
     };
 }
@@ -672,6 +675,7 @@ fn routedCodebook(c: *const Config) experts.Codebook {
     return switch (c.routed_codebook) {
         .mcg => .mcg,
         .mcg_e4m3 => .mcg_e4m3,
+        .mul1 => .mul1,
     };
 }
 
@@ -786,22 +790,24 @@ fn loadLayer(L: *Loader, c: *const Config, sh: share_mod.Share, i: usize) !Devic
     }
     m.router = try plain(L, try std.fmt.bufPrint(&nb, "{s}mlp.gate.weight", .{p}), null, null, .bf16);
     m.bias = try plain(L, try std.fmt.bufPrint(&nb, "{s}mlp.gate.e_score_correction_bias", .{p}), null, null, .f32);
+    const moe_span = sh.moeForLayer(i);
     if (L.plan != null) {
-        try planExperts(L, i, c.experts, c.hidden, c.moe_inter, sh.moe.lo, sh.moe.hi);
+        try planExperts(L, i, c.experts, c.hidden, c.moe_inter, moe_span.lo, moe_span.hi);
         m.routed = undefined;
     } else {
         // One exact reservation for WP4's host staging (the largest projection's rank half), so the ArrayList never
         // grows by doubling through about 0.4 GiB (review N9). experts.load reads at most 5 tensors per expert before
         // it consumes them; the O_DIRECT ring holds Direct.ring_len = 8.
-        try L.host.ensureTotalCapacityPrecise(L.gpa, try expertsHostBytes(L, i, c.experts, c.hidden, sh.moe.lo, sh.moe.hi));
+        try L.host.ensureTotalCapacityPrecise(L.gpa, try expertsHostBytes(L, i, c.experts, c.hidden, moe_span.lo, moe_span.hi));
         L.hold_host = true;
         defer {
             L.hold_host = false;
             L.trimHost();
         }
-        m.routed = try experts.load(L, i, c.experts, c.hidden, c.moe_inter, sh.moe.lo, sh.moe.hi, routedCodebook(c));
+        m.routed = try experts.load(L, i, c.experts, c.hidden, c.moe_inter, moe_span.lo, moe_span.hi, routedCodebook(c));
     }
-    const shared: Span = .{ .lo = sh.shared.lo, .hi = sh.shared.hi };
+    const shared_span = sh.sharedForLayer(i);
+    const shared: Span = .{ .lo = shared_span.lo, .hi = shared_span.hi };
     m.shared = .{
         .gate_up = try linear(L, &.{
             .{ .prefix = try std.fmt.bufPrint(&gb, "{s}mlp.shared_experts.gate_proj.", .{p}), .rows = shared },
@@ -901,13 +907,17 @@ fn openCheckpoint(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, c: *const
 }
 
 fn checkShape(c: *const Config, rank: usize, world: usize) !void {
-    if (world != 2 or rank >= world) return error.BadTensorParallelRank;
+    if ((world != 2 and world != 3) or rank >= world) return error.BadTensorParallelRank;
     // This build has no MTP layer: a config that runs an MTP layer is refused, not half-loaded.
     if (c.mtp != 0) return error.MtpLayerNotInBuild;
     // The MLA kv_write kernel hard-codes RMSNorm eps 1e-5; the indexer takes config.indexer_eps (review L5).
     if (c.eps != 1e-5) return error.UnsupportedRmsEps;
-    // forward.embedRowFor splits the vocabulary in equal halves of whole 128-row blocks (review L10).
-    if (c.vocab % (128 * world) != 0) return error.UnsupportedVocabSplit;
+    // Vocabulary splits in blocks of 128 rows (TP=2: equal halves; TP=3: 51712, 51584, 51584).
+    if (world == 3) {
+        if (c.vocab != 154880 or c.vocab % 128 != 0) return error.UnsupportedVocabSplit;
+    } else {
+        if (c.vocab % (128 * world) != 0) return error.UnsupportedVocabSplit;
+    }
 }
 
 /// The globals first (embed, final norm, lm_head: the largest host transients, done while device use is lowest),
@@ -943,11 +953,30 @@ fn walk(L: *Loader, c: *const Config, rank: usize, world: usize, select: Select,
     }
 }
 
+fn isIgnoredUnused(k: []const u8) bool {
+    // MTP layers (e.g. layers.78)
+    if (std.mem.indexOf(u8, k, "layers.78.") != null) return true;
+    // Superseded non-expert EXL3 weights when backbone is converted to FP8
+    if (std.mem.indexOf(u8, k, ".mlp.experts.") == null) {
+        if (std.mem.endsWith(u8, k, ".trellis") or
+            std.mem.endsWith(u8, k, ".suh") or
+            std.mem.endsWith(u8, k, ".svh") or
+            std.mem.endsWith(u8, k, ".su") or
+            std.mem.endsWith(u8, k, ".sv") or
+            std.mem.endsWith(u8, k, ".mul1") or
+            std.mem.endsWith(u8, k, ".mcg") or
+            std.mem.endsWith(u8, k, ".mcg_e4m3") or
+            std.mem.endsWith(u8, k, ".bias")) return true;
+    }
+    return false;
+}
+
 /// Names no get took, counted without a log line; `names` (if given) receives up to its length of them.
 fn unusedNames(ck: *const core.Checkpoint, names: ?*std.ArrayList([]const u8), gpa: std.mem.Allocator) !usize {
     var n: usize = 0;
     for (ck.files.items) |*f| for (f.names.keys()) |k| {
         if (ck.used.contains(k)) continue;
+        if (isIgnoredUnused(k)) continue;
         if (names) |list| try list.append(gpa, try gpa.dupe(u8, k));
         n += 1;
     };

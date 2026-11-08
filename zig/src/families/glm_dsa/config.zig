@@ -6,7 +6,7 @@ const std = @import("std");
 pub const max_layers = 96;
 
 pub const KvFormat = enum { bf16, fp8 };
-pub const RoutedCodebook = enum { mcg, mcg_e4m3 };
+pub const RoutedCodebook = enum { mcg, mcg_e4m3, mul1 };
 pub const BackboneFormat = enum { bf16, fp8_block, other };
 pub const Backend = enum { metal, cuda };
 
@@ -70,16 +70,38 @@ pub const Config = struct {
     }
     /// The attention heads this Mac runs: [head0, head0 + localHeads).
     pub fn localHeads(c: *const Config) u32 {
+        if (c.ranks == 3 and c.heads == 64) {
+            return if (c.rank == 2) 20 else 22;
+        }
         return c.heads / c.ranks;
     }
     pub fn head0(c: *const Config) u32 {
+        if (c.ranks == 3 and c.heads == 64) {
+            return switch (c.rank) {
+                0 => 0,
+                1 => 22,
+                2 => 44,
+                else => 0,
+            };
+        }
         return c.rank * c.localHeads();
     }
     /// Each routed or shared expert's 128-channel halves this Mac holds: [half0, half0 + localHalves).
     pub fn localHalves(c: *const Config) u32 {
+        if (c.ranks == 3 and c.moe_inter == 2048) {
+            return if (c.rank == 0) 6 else 5;
+        }
         return c.moe_inter / 128 / c.ranks;
     }
     pub fn half0(c: *const Config) u32 {
+        if (c.ranks == 3 and c.moe_inter == 2048) {
+            return switch (c.rank) {
+                0 => 0,
+                1 => 6,
+                2 => 11,
+                else => 0,
+            };
+        }
         return c.rank * c.localHalves();
     }
     pub fn localDense(c: *const Config) u32 {
@@ -87,6 +109,14 @@ pub const Config = struct {
     }
     /// The head's vocabulary rows [lo, hi) this Mac computes.
     pub fn vocabPart(c: *const Config) [2]u32 {
+        if (c.ranks == 3 and c.vocab == 154880) {
+            return switch (c.rank) {
+                0 => .{ 0, 51712 },
+                1 => .{ 51712, 103296 },
+                2 => .{ 103296, 154880 },
+                else => .{ 0, 0 },
+            };
+        }
         const n = c.vocab / c.ranks;
         return .{ c.rank * n, if (c.rank + 1 == c.ranks) c.vocab else (c.rank + 1) * n };
     }
@@ -201,9 +231,9 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8) !Config {
     const quant = if (quant_value) |q| (if (q == .object) q.object else null) else null;
     c.backbone = if (quant_value != null and quant == null) .other else backboneFormat(quant);
     if (str(t, "routed_codebook")) |v| {
-        if (std.mem.eql(u8, v, "mcg")) c.routed_codebook = .mcg else if (std.mem.eql(u8, v, "mcg_e4m3")) c.routed_codebook = .mcg_e4m3 else return error.UnsupportedCodebook;
+        if (std.mem.eql(u8, v, "mcg")) c.routed_codebook = .mcg else if (std.mem.eql(u8, v, "mcg_e4m3")) c.routed_codebook = .mcg_e4m3 else if (std.mem.eql(u8, v, "mul1")) c.routed_codebook = .mul1 else return error.UnsupportedCodebook;
     } else if (quant) |q| if (str(q, "routed_codebook")) |v| {
-        if (std.mem.eql(u8, v, "mcg")) c.routed_codebook = .mcg else if (std.mem.eql(u8, v, "mcg_e4m3")) c.routed_codebook = .mcg_e4m3 else return error.UnsupportedCodebook;
+        if (std.mem.eql(u8, v, "mcg")) c.routed_codebook = .mcg else if (std.mem.eql(u8, v, "mcg_e4m3")) c.routed_codebook = .mcg_e4m3 else if (std.mem.eql(u8, v, "mul1")) c.routed_codebook = .mul1 else return error.UnsupportedCodebook;
     };
     if (t.get("eos_token_id")) |v| if (v == .array and v.array.items.len <= 3) {
         c.eos_n = @intCast(v.array.items.len);
@@ -220,8 +250,14 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8) !Config {
 
 /// Tensor parallel over `ranks` Macs: heads, dense rows, expert halves and vocabulary rows split evenly.
 pub fn split(c: *Config, rank: u32, ranks: u32) !void {
-    if (ranks == 0 or rank >= ranks or c.heads % ranks != 0 or (c.moe_inter / 128) % ranks != 0 or c.dense_inter % (128 * ranks) != 0)
-        return error.BadSplit;
+    if (ranks == 0 or rank >= ranks) return error.BadSplit;
+    if (ranks == 3) {
+        if (c.heads != 64 or c.moe_inter != 2048 or c.dense_inter % (128 * ranks) != 0 or c.vocab != 154880)
+            return error.BadSplit;
+    } else {
+        if (c.heads % ranks != 0 or (c.moe_inter / 128) % ranks != 0 or c.dense_inter % (128 * ranks) != 0)
+            return error.BadSplit;
+    }
     c.rank = rank;
     c.ranks = ranks;
 }
@@ -236,7 +272,25 @@ test "GLM-5.3's indexer pattern: layers 0-2 full, then every fourth from 6; shar
     try std.testing.expectEqual(@as(u32, 32), c.head0());
     try std.testing.expectEqual(@as(u32, 8), c.half0());
     try std.testing.expectEqual([2]u32{ 77440, 154880 }, c.vocabPart());
-    try std.testing.expectError(error.BadSplit, split(&c, 0, 3));
+    try split(&c, 0, 3);
+    try std.testing.expectEqual(@as(u32, 22), c.localHeads());
+    try std.testing.expectEqual(@as(u32, 0), c.head0());
+    try std.testing.expectEqual(@as(u32, 6), c.localHalves());
+    try std.testing.expectEqual(@as(u32, 0), c.half0());
+    try std.testing.expectEqual([2]u32{ 0, 51712 }, c.vocabPart());
+    try split(&c, 1, 3);
+    try std.testing.expectEqual(@as(u32, 22), c.localHeads());
+    try std.testing.expectEqual(@as(u32, 22), c.head0());
+    try std.testing.expectEqual(@as(u32, 5), c.localHalves());
+    try std.testing.expectEqual(@as(u32, 6), c.half0());
+    try std.testing.expectEqual([2]u32{ 51712, 103296 }, c.vocabPart());
+    try split(&c, 2, 3);
+    try std.testing.expectEqual(@as(u32, 20), c.localHeads());
+    try std.testing.expectEqual(@as(u32, 44), c.head0());
+    try std.testing.expectEqual(@as(u32, 5), c.localHalves());
+    try std.testing.expectEqual(@as(u32, 11), c.half0());
+    try std.testing.expectEqual([2]u32{ 103296, 154880 }, c.vocabPart());
+    try std.testing.expectError(error.BadSplit, split(&c, 0, 5));
 }
 
 test "config declarations are fully analyzed and unknown quantization is labeled other" {

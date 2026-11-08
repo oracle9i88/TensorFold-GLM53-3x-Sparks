@@ -6,6 +6,17 @@ const cuda = @import("cuda");
 pub const Geometry = @import("geometry").Geometry;
 const glm = @import("glm");
 
+const EmbedRow = struct { owner: i32, local: i32 };
+fn embedRowFor(token: u32, rank: usize, vocab_local: usize) EmbedRow {
+    if (vocab_local == 51712 or vocab_local == 51584) {
+        const o: usize = if (token < 51712) 0 else if (token < 103296) 1 else 2;
+        const offset: u32 = if (o == 0) 0 else if (o == 1) 51712 else 103296;
+        return .{ .owner = @intCast(o), .local = if (o == rank) @intCast(token - offset) else 0 };
+    }
+    const o = token / vocab_local;
+    return .{ .owner = @intCast(o), .local = if (o == rank) @intCast(token - o * vocab_local) else 0 };
+}
+
 pub const head_chunk_rows: usize = 8192;
 
 pub fn shareScratchEnabled() bool {
@@ -60,7 +71,7 @@ pub fn quantizePacked(unpack: cuda.Function, quant: *const glm.quant.Kernels, s:
 }
 
 pub fn packerTransientBytes(g: Geometry, world: usize) u64 {
-    const n = g.vocab / world;
+    const n = if (world == 3) 51712 else g.vocab / world;
     const k = g.hidden;
     return @intCast(n * k / 2 + 2 * (n * k / 32) + head_chunk_rows * k * 2);
 }
@@ -92,7 +103,7 @@ pub const Host = struct {
     group: ?*const cuda.tp_group.Group,
     lib: *const cuda.nccl.Library,
     comm: cuda.nccl.Comm,
-    spans: [2]glm.shard.Span,
+    spans: [3]glm.shard.Span,
     share: struct { rank: usize, vocab: glm.shard.Span },
     m: struct { glue: glm.glue.Kernels, mm: glm.mm.Kernels, q4: glm.q4.Kernels, quant: glm.quant.Kernels },
     w: struct { embed: u64, head: ?cuda.qmmf.Weight, mtp: ?struct { draft: glm.q4.Q4 } = null },
@@ -127,7 +138,7 @@ pub const Host = struct {
         const quant = try glm.quant.Kernels.load(modules[3]);
         const unpack = try glm53_glue.function("tf_glm53_unpack_bf16_rows");
         const embed_pick = try glm53_glue.function("tf_glm53_embed_pick");
-        const scratch_len = 2 * glm.dflash.MAX_M * 6144 * 2 + 2 * glm.dflash.MAX_M * 4;
+        const scratch_len = group.world * glm.dflash.MAX_M * 6144 * 2 + 2 * glm.dflash.MAX_M * 4;
         var scratch = try cuda.DeviceBuffer.alloc(ctx.d, scratch_len);
         errdefer scratch.free();
         const vl = vocab.len();
@@ -138,7 +149,10 @@ pub const Host = struct {
             .group = group,
             .lib = &group.lib,
             .comm = group.comm,
-            .spans = .{ .{ .lo = 0, .hi = vl }, .{ .lo = vl, .hi = 2 * vl } },
+            .spans = if (group.world == 3)
+                .{ .{ .lo = 0, .hi = 51712 }, .{ .lo = 51712, .hi = 103296 }, .{ .lo = 103296, .hi = 154880 } }
+            else
+                .{ .{ .lo = 0, .hi = vl }, .{ .lo = vl, .hi = 2 * vl }, .{ .lo = 0, .hi = 0 } },
             .share = .{ .rank = rank, .vocab = vocab },
             .m = .{ .glue = glue, .mm = mm, .q4 = q4, .quant = quant },
             .w = .{ .embed = embed, .head = head },
@@ -151,7 +165,7 @@ pub const Host = struct {
 
     pub fn load(h: *Host, io: std.Io, dir: []const u8, bits: u8, share_scratch: bool) !void {
         if (bits != 4) return error.BadDrafterBits;
-        h.dr = try Drafter.load(h.gpa, io, h, dir, h.share.rank, 2, bits, try checkConfig(h.gpa, io, dir), share_scratch);
+        h.dr = try Drafter.load(h.gpa, io, h, dir, h.share.rank, h.group.?.world, bits, try checkConfig(h.gpa, io, dir), share_scratch);
         const conf_temp = try confTempSwitch();
         h.dr.?.conf_temp = conf_temp;
         if (h.share.rank == 0) std.log.info("glm53 draft conf temp: {d:.3}", .{conf_temp});
@@ -175,13 +189,19 @@ pub const Host = struct {
         _ = ids;
         const vl = h.share.vocab.len();
         const gathered = h.scratch.ptr;
-        const gathered_cap = 2 * glm.dflash.MAX_M * 6144 * 2;
+        const gathered_cap = h.group.?.world * glm.dflash.MAX_M * 6144 * 2;
         const local_dev = gathered + gathered_cap;
         const owners_dev = local_dev + glm.dflash.MAX_M * 4;
         for (h.dr.?.h_ids[0..rows], 0..) |id, r| {
-            const owner = @divTrunc(id, @as(i32, @intCast(vl))); // ids are non-negative token ids
-            h.h_owner[r] = owner;
-            h.h_local[r] = if (owner == @as(i32, @intCast(h.share.rank))) id - owner * @as(i32, @intCast(vl)) else 0;
+            if (h.group.?.world == 3) {
+                const er = embedRowFor(@intCast(id), h.share.rank, vl);
+                h.h_owner[r] = er.owner;
+                h.h_local[r] = er.local;
+            } else {
+                const owner = @divTrunc(id, @as(i32, @intCast(vl))); // ids are non-negative token ids
+                h.h_owner[r] = owner;
+                h.h_local[r] = if (owner == @as(i32, @intCast(h.share.rank))) id - owner * @as(i32, @intCast(vl)) else 0;
+            }
         }
         try h.d.check(h.d.api.cuMemcpyHtoDAsync_v2(local_dev, @ptrCast(&h.h_local), rows * @sizeOf(i32), h.stream.handle), "cuMemcpyHtoDAsync");
         try h.d.check(h.d.api.cuMemcpyHtoDAsync_v2(owners_dev, @ptrCast(&h.h_owner), rows * @sizeOf(i32), h.stream.handle), "cuMemcpyHtoDAsync");
@@ -194,7 +214,7 @@ pub const Host = struct {
         a.add(out);
         a.add(@as(c_int, @intCast(rows)));
         a.add(@as(c_int, @intCast(width)));
-        a.add(@as(c_int, 2));
+        a.add(@as(c_int, @intCast(h.group.?.world)));
         try cuda.launch.launch(h.embed_pick, .{ .grid = .{ .x = @intCast((rows * width + 255) / 256) }, .block = .{ .x = 256 } }, h.stream, &a);
     }
 
@@ -294,8 +314,9 @@ pub fn runtimeGeometry(geometry: Geometry) glm.dflash.Geometry {
 const PackedHead = struct { buffer: @import("cuda").DeviceBuffer, head: glm.q4.Q4 };
 
 fn packTargetHead(h: anytype, geometry: Geometry, rank: usize, world: usize) !PackedHead {
-    if (world == 0 or world > 2 or rank >= world or geometry.vocab % world != 0 or h.share.rank != rank) return error.BadDrafterWorld;
-    const n = geometry.vocab / world;
+    if (world == 0 or world > 3 or rank >= world or h.share.rank != rank) return error.BadDrafterWorld;
+    if (world != 3 and geometry.vocab % world != 0) return error.BadDrafterWorld;
+    const n = if (world == 3) (if (rank == 0) @as(usize, 51712) else @as(usize, 51584)) else geometry.vocab / world;
     const k = geometry.hidden;
     const w = h.w.head orelse return error.DrafterNeedsTargetHead;
     if (w.mode != .bf16 or @as(usize, w.n) != n or @as(usize, w.k) != k or w.codes == 0) return error.DraftHeadShape;
@@ -450,10 +471,10 @@ pub fn checkConfig(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !Geometr
 /// Four-bit linears use one nibble plus affine metadata per 64 weights; eight-bit is a byte per weight.
 pub fn weightBytes(g: Geometry, bits: u8, world: usize) !u64 {
     if (bits != 4 and bits != 8) return error.BadDrafterBits;
-    if (world == 0 or world > 2) return error.BadDrafterWorld;
+    if (world == 0 or world > 3) return error.BadDrafterWorld;
     const d: u64 = @intCast(g.hidden);
     const kv: u64 = @intCast(g.kvWidth());
-    const ff: u64 = @intCast(g.intermediate / world);
+    const ff: u64 = @intCast(if (world == 2) g.intermediate / 2 else g.intermediate);
     const qkv: u64 = @intCast(g.qkvWidth());
     const conv: u64 = @intCast(g.convWidth());
     const qw: u64 = @intCast(g.queryWidth());
@@ -493,10 +514,11 @@ pub const MemoryPlan = struct {
 };
 
 pub fn memoryPlan(g: Geometry, bits: u8, world: usize, streams: usize) !MemoryPlan {
-    if (world == 0 or world > 2 or g.vocab % world != 0) return error.BadDrafterWorld;
+    if (world == 0 or world > 3) return error.BadDrafterWorld;
+    if (world == 2 and g.vocab % 2 != 0) return error.BadDrafterWorld;
     if (streams == 0 or streams > 16) return error.BadDrafterStreams;
     const d: u64 = @intCast(g.hidden);
-    const ff: u64 = @intCast(g.intermediate / world);
+    const ff: u64 = @intCast(if (world == 2) g.intermediate / 2 else g.intermediate);
     const qkv: u64 = @intCast(g.qkvWidth());
     const kv: u64 = @intCast(g.kvWidth());
     const qw: u64 = @intCast(g.queryWidth());
@@ -504,7 +526,7 @@ pub fn memoryPlan(g: Geometry, bits: u8, world: usize, streams: usize) !MemoryPl
     const m: u64 = 16 * g.block;
     const c: u64 = @intCast(g.window);
     const rank: u64 = @intCast(g.selector_rank);
-    const head_n = g.vocab / world;
+    const head_n: u64 = if (world == 3) 51712 else @intCast(g.vocab / world);
     const chunks = (head_n + 4095) / 4096;
     const mm = @import("glm").mm;
     var part: u64 = 16;
@@ -595,8 +617,11 @@ test "fake driver launch and record order keeps shared drafter writes outside fo
 
 /// The target-derived Q4 draft head for this rank's vocabulary rows.
 pub fn draftHeadBytes(g: Geometry, world: usize) !u64 {
-    if (world == 0 or world > 2 or g.vocab % world != 0) return error.BadDrafterWorld;
-    return @intCast((g.vocab / world) * g.hidden / 2 + (g.vocab / world) * (g.hidden / 64) * 4);
+    if (world == 0 or world > 3) return error.BadDrafterWorld;
+    if (world == 2 and g.vocab % 2 != 0) return error.BadDrafterWorld;
+    const hn: u64 = if (world == 3) 51712 else @intCast(g.vocab / world);
+    const d: u64 = @intCast(g.hidden);
+    return @intCast(hn * d / 2 + hn * (d / 64) * 4);
 }
 
 fn stripHeader(bytes: []const u8) []const u8 {

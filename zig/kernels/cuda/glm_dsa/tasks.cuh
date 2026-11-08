@@ -182,20 +182,28 @@ __device__ __forceinline__ void tf_glm53_moe_post_task(const tf_glm53_moe_post_p
 __device__ __forceinline__ void tf_glm53_residual_rmsnorm_6144_task(const tf_glm53_residual_rmsnorm_6144_params& p, int block_idx, int, char*) {
   constexpr int S = 8, NW = 8, T = NW * 32, TILE = S * T, REPS = (6144 + TILE - 1) / TILE;
   const int row = block_idx, t = threadIdx.x;
-  const int64_t rs = (int64_t)p.rows * 6144;
+  const int world = ((unsigned int)p.rows >> 24) != 0 ? (int)((unsigned int)p.rows >> 24) : 2;
+  const int rows = (int)((unsigned int)p.rows & 0x00FFFFFF);
+  const int64_t rs = (int64_t)rows * 6144;
   float residual[REPS * S];
 #pragma unroll
   for (int rep = 0; rep < REPS; ++rep) {
     const int d = rep * TILE + t * S;
     if (d >= 6144) continue;
-    float a[S], old[S];
-    glm_glue::ld8(p.parts + (int64_t)row * 6144 + d, a);
-    glm_glue::ld8(p.parts + rs + (int64_t)row * 6144 + d, old);
+    float sum_parts[S];
+    glm_glue::ld8(p.parts + (int64_t)row * 6144 + d, sum_parts);
+    for (int r = 1; r < world; ++r) {
+      float part[S];
+      glm_glue::ld8(p.parts + (int64_t)r * rs + (int64_t)row * 6144 + d, part);
+#pragma unroll
+      for (int j = 0; j < S; ++j) {
+        sum_parts[j] = __fadd_rn(sum_parts[j], part[j]);
+      }
+    }
     glm_glue::ld8(p.x + (int64_t)row * 6144 + d, residual + rep * S);
 #pragma unroll
     for (int j = 0; j < S; ++j) {
-      const float sum = __fadd_rn(a[j], old[j]);
-      residual[rep * S + j] = __fadd_rn(residual[rep * S + j], glm_glue::rbf(sum));
+      residual[rep * S + j] = __fadd_rn(residual[rep * S + j], glm_glue::rbf(sum_parts[j]));
     }
     glm_glue::st8(p.x + (int64_t)row * 6144 + d, residual + rep * S);
   }
@@ -206,13 +214,19 @@ __device__ __forceinline__ void tf_glm53_residual_rmsnorm_6144_task(const tf_glm
 __device__ __forceinline__ void tf_glm53_ablate_6144_task(const tf_glm53_ablate_6144_params& p, int row, int, char*) {
   __shared__ float sums[8];
   const int t = threadIdx.x;
+  const int world = ((unsigned int)p.rows >> 24) != 0 ? (int)((unsigned int)p.rows >> 24) : 2;
+  const int rows = (int)((unsigned int)p.rows & 0x00FFFFFF);
   const float* p0 = static_cast<const float*>(p.parts);
   const __nv_bfloat16* b0 = static_cast<const __nv_bfloat16*>(p.parts);
   float acc = 0.0f;
   for (int u = 0; u < 24; ++u) {
     const int j = t + 256 * u;
-    const float d = p.kind == 0 ? __fadd_rn(p0[(int64_t)row * 6144 + j], p0[(int64_t)(p.rows + row) * 6144 + j])
-      : __fadd_rn(__bfloat162float(b0[(int64_t)row * 6144 + j]), __bfloat162float(b0[(int64_t)(p.rows + row) * 6144 + j]));
+    float d = 0.0f;
+    for (int r = 0; r < world; ++r) {
+      const float val = p.kind == 0 ? p0[(int64_t)(r * rows + row) * 6144 + j]
+        : __bfloat162float(b0[(int64_t)(r * rows + row) * 6144 + j]);
+      d = __fadd_rn(d, val);
+    }
     acc = fmaf(p.r[j], glm_glue::rbf(d), acc);
   }
   for (int o = 16; o >= 1; o >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, o);
@@ -238,9 +252,14 @@ __device__ __forceinline__ void tf_glm53_ablate_6144_task(const tf_glm53_ablate_
 }
 
 __device__ __forceinline__ void tf_glm53_moe_residual_add_task(const tf_glm53_moe_residual_add_params& p, int block_idx, int, char*) {
+  const int world = ((unsigned int)p.count >> 28) != 0 ? (int)((unsigned int)p.count >> 28) : 2;
+  const int count = (int)((unsigned int)p.count & 0x0FFFFFFF);
   const int i = block_idx * tf_glm53_moe_residual_add_params::block_size + threadIdx.x;
-  if (i >= p.count) return;
-  const float rank_sum = __fadd_rn(__bfloat162float(p.parts[i]), __bfloat162float(p.parts[p.count + i]));
+  if (i >= count) return;
+  float rank_sum = __bfloat162float(p.parts[i]);
+  for (int r = 1; r < world; ++r) {
+    rank_sum = __fadd_rn(rank_sum, __bfloat162float(p.parts[(int64_t)r * count + i]));
+  }
   const float residual = __fadd_rn(__bfloat162float(p.x[i]), __bfloat162float(__float2bfloat16_rn(rank_sum)));
   p.xout[i] = __float2bfloat16_rn(residual);
 }

@@ -125,7 +125,7 @@ fn projection(L: anytype, layer_index: usize, expert_count: usize, dims: usize, 
         // `routed_codebook: mcg_e4m3` keep the `.mcg` marker on every expert (the Python engine reads the config).
         if (marked != null and marked.? == .mcg and routed_codebook == .mcg_e4m3) marked = .mcg_e4m3;
         if (marked == null or marked.? != routed_codebook) return error.BadExpertCodebook;
-        if (marked.? != .mcg and marked.? != .mcg_e4m3) return error.BadExpertCodebook;
+        if (marked.? != .mcg and marked.? != .mcg_e4m3 and marked.? != .mul1) return error.BadExpertCodebook;
         const word_bytes = t.dim(2) * 2;
         const tk = k / 16;
         const tn = n / 16;
@@ -184,7 +184,7 @@ fn projection(L: anytype, layer_index: usize, expert_count: usize, dims: usize, 
 
 /// Append the mixed-width EXL3 tensors for one expert layer. `routed_codebook` is explicit for packs marked `.mcg`.
 pub fn load(L: anytype, layer_index: usize, expert_count: usize, dims: usize, full_width: usize, lo: usize, hi: usize, routed_codebook: Codebook) !Loaded {
-    if (routed_codebook != .mcg and routed_codebook != .mcg_e4m3) return error.BadExpertCodebook;
+    if (routed_codebook != .mcg and routed_codebook != .mcg_e4m3 and routed_codebook != .mul1) return error.BadExpertCodebook;
     const g = try projection(L, layer_index, expert_count, dims, full_width, lo, hi, routed_codebook, "gate_proj", false);
     const u = try projection(L, layer_index, expert_count, dims, full_width, lo, hi, routed_codebook, "up_proj", false);
     const d = try projection(L, layer_index, expert_count, dims, full_width, lo, hi, routed_codebook, "down_proj", true);

@@ -301,7 +301,7 @@ __device__ __forceinline__ void tf_glm53_attend_task(const __nv_bfloat16* qa, co
       }
       float score = 0.f;
       const int group = h / 32, head = h % 32;
-      const int64_t query = ((int64_t)group * rows + r) * 32 + head;
+      const int64_t query = local_heads < 32 ? (int64_t)r * local_heads + h : (((int64_t)group * rows + r) * 32 + head);
       for (int k = 0; k < LD; ++k)
         score = __fmaf_rn(tf_mla::bf(qa[query * LD + k]), tf_mla::bf(kl[(int64_t)slot * LD + k]), score);
       for (int k = 0; k < PD; ++k)
@@ -316,18 +316,28 @@ __device__ __forceinline__ void tf_glm53_attend_task(const __nv_bfloat16* qa, co
       maximum = next;
     }
   }
-  const int group = h / 32, head = h % 32;
-  const int64_t query = ((int64_t)group * rows + r) * 32 + head;
-  constexpr int group_row_bytes = 32 * LD * sizeof(__nv_bfloat16) + 32 * sizeof(float);
-  const int64_t group_byte = (int64_t)group * rows * group_row_bytes;
-  const int64_t group_partial = group_byte / (int)sizeof(__nv_bfloat16);
-  const int64_t base = group_partial + ((int64_t)r * 32 + head) * LD;
-  partial[base + d] = rb(denom == 0.f ? 0.f : value0 / denom);
-  partial[base + d + TF_VBDIM.x] = rb(denom == 0.f ? 0.f : value1 / denom);
-  if (d == 0) {
-    float* group_lse = reinterpret_cast<float*>(reinterpret_cast<unsigned char*>(partial) +
-        group_byte + rows * 32 * LD * (int)sizeof(__nv_bfloat16));
-    group_lse[(int64_t)r * 32 + head] = denom == 0.f ? -CUDART_INF_F : maximum + logf(denom);
+  if (local_heads < 32) {
+    const int64_t base = ((int64_t)r * local_heads + h) * LD;
+    partial[base + d] = rb(denom == 0.f ? 0.f : value0 / denom);
+    partial[base + d + TF_VBDIM.x] = rb(denom == 0.f ? 0.f : value1 / denom);
+    if (d == 0) {
+      const int64_t partial_bytes = (int64_t)rows * local_heads * LD * (int)sizeof(__nv_bfloat16);
+      float* group_lse = reinterpret_cast<float*>(reinterpret_cast<unsigned char*>(partial) + partial_bytes);
+      group_lse[(int64_t)r * local_heads + h] = denom == 0.f ? -CUDART_INF_F : maximum + logf(denom);
+    }
+  } else {
+    const int group = h / 32, head = h % 32;
+    constexpr int group_row_bytes = 32 * LD * sizeof(__nv_bfloat16) + 32 * sizeof(float);
+    const int64_t group_byte = (int64_t)group * rows * group_row_bytes;
+    const int64_t group_partial = group_byte / (int)sizeof(__nv_bfloat16);
+    const int64_t base = group_partial + ((int64_t)r * 32 + head) * LD;
+    partial[base + d] = rb(denom == 0.f ? 0.f : value0 / denom);
+    partial[base + d + TF_VBDIM.x] = rb(denom == 0.f ? 0.f : value1 / denom);
+    if (d == 0) {
+      float* group_lse = reinterpret_cast<float*>(reinterpret_cast<unsigned char*>(partial) +
+          group_byte + rows * 32 * LD * (int)sizeof(__nv_bfloat16));
+      group_lse[(int64_t)r * 32 + head] = denom == 0.f ? -CUDART_INF_F : maximum + logf(denom);
+    }
   }
 }
 
@@ -531,7 +541,7 @@ __device__ __forceinline__ void tf_glm53_attend_mma_task(const __nv_bfloat16* qa
                                             int local_heads, int rank, int world, int prefill,
                                             float* split_ws, int split_tiles) {
   const int r = TF_VBID.x, group = TF_VBID.y, split = TF_VBID.z, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-  if (r >= rows || group >= local_heads / 32) return;
+  if (r >= rows || group >= (local_heads + 31) / 32) return;
   extern __shared__ __align__(16) unsigned char mma_smem[];
   __nv_bfloat16* qs = reinterpret_cast<__nv_bfloat16*>(mma_smem);                 // [32][MMA_QS]
   __nv_bfloat16* ks0 = qs + 32 * MMA_QS;                                            // [2][16][MMA_QS]: double buffer
@@ -542,11 +552,17 @@ __device__ __forceinline__ void tf_glm53_attend_mma_task(const __nv_bfloat16* qa
   float* halpha = hden + 32;
   int* kslot0 = reinterpret_cast<int*>(halpha + 32);                               // [2][16]
   int* kplane0 = kslot0 + 2 * MMA_KT;                                               // [2][16]: 0 owner plane, 1 stage
-  const int64_t qrow = ((int64_t)group * rows + r) * 32;
+  const int64_t qrow = local_heads < 32 ? (int64_t)r * local_heads : (((int64_t)group * rows + r) * 32);
   for (int x = tid; x < 32 * 72; x += 256) {   // 72 16-byte pieces a head: 64 latent + 8 rope
     const int h = x / 72, c = x % 72;
-    const uint4* src = c < 64 ? reinterpret_cast<const uint4*>(qa + (qrow + h) * LD) + c : reinterpret_cast<const uint4*>(qpe + (qrow + h) * PD) + (c - 64);
-    reinterpret_cast<uint4*>(qs + h * MMA_QS)[c] = *src;
+    uint4 val;
+    if (local_heads < 32 && h >= local_heads) {
+      val = make_uint4(0, 0, 0, 0);
+    } else {
+      const uint4* src = c < 64 ? reinterpret_cast<const uint4*>(qa + (qrow + h) * LD) + c : reinterpret_cast<const uint4*>(qpe + (qrow + h) * PD) + (c - 64);
+      val = *src;
+    }
+    reinterpret_cast<uint4*>(qs + h * MMA_QS)[c] = val;
   }
   if (tid < 32) { hmax[tid] = -CUDART_INF_F; hden[tid] = 0.f; }
   const int64_t qpos = positions[r];
@@ -699,26 +715,50 @@ __device__ __forceinline__ void tf_glm53_attend_mma_task(const __nv_bfloat16* qa
     if (tid < 32) { w[tid * (LD + 2) + LD] = hmax[tid]; w[tid * (LD + 2) + LD + 1] = hden[tid]; }
     return;
   }
-  constexpr int group_row_bytes = 32 * LD * sizeof(__nv_bfloat16) + 32 * sizeof(float);
-  const int64_t group_byte = (int64_t)group * rows * group_row_bytes;
-  const int64_t group_partial = group_byte / (int)sizeof(__nv_bfloat16);
+  if (local_heads < 32) {
+    const int64_t partial_bytes = (int64_t)rows * local_heads * LD * (int)sizeof(__nv_bfloat16);
+    float* group_lse = reinterpret_cast<float*>(reinterpret_cast<unsigned char*>(partial) + partial_bytes);
 #pragma unroll
-  for (int mt = 0; mt < 2; ++mt)
+    for (int mt = 0; mt < 2; ++mt)
 #pragma unroll
-    for (int hh = 0; hh < 2; ++hh) {
-      const int head = mt * 16 + g + 8 * hh;
-      const float den = hden[head];
-      __nv_bfloat16* dst = partial + group_partial + ((int64_t)r * 32 + head) * LD;
+      for (int hh = 0; hh < 2; ++hh) {
+        const int head = mt * 16 + g + 8 * hh;
+        if (head < local_heads) {
+          const float den = hden[head];
+          __nv_bfloat16* dst = partial + ((int64_t)r * local_heads + head) * LD;
 #pragma unroll
-      for (int t = 0; t < 8; ++t) {
-        const int col = warp * 64 + t * 8 + 2 * q;
-        dst[col] = rb(den == 0.f ? 0.f : o[mt][t][2 * hh] / den);
-        dst[col + 1] = rb(den == 0.f ? 0.f : o[mt][t][2 * hh + 1] / den);
+          for (int t = 0; t < 8; ++t) {
+            const int col = warp * 64 + t * 8 + 2 * q;
+            dst[col] = rb(den == 0.f ? 0.f : o[mt][t][2 * hh] / den);
+            dst[col + 1] = rb(den == 0.f ? 0.f : o[mt][t][2 * hh + 1] / den);
+          }
+        }
       }
+    if (tid < local_heads) {
+      group_lse[(int64_t)r * local_heads + tid] = hden[tid] == 0.f ? -CUDART_INF_F : hmax[tid] + logf(hden[tid]);
     }
-  if (tid < 32) {
-    float* group_lse = reinterpret_cast<float*>(reinterpret_cast<unsigned char*>(partial) + group_byte + rows * 32 * LD * (int)sizeof(__nv_bfloat16));
-    group_lse[(int64_t)r * 32 + tid] = hden[tid] == 0.f ? -CUDART_INF_F : hmax[tid] + logf(hden[tid]);
+  } else {
+    constexpr int group_row_bytes = 32 * LD * sizeof(__nv_bfloat16) + 32 * sizeof(float);
+    const int64_t group_byte = (int64_t)group * rows * group_row_bytes;
+    const int64_t group_partial = group_byte / (int)sizeof(__nv_bfloat16);
+#pragma unroll
+    for (int mt = 0; mt < 2; ++mt)
+#pragma unroll
+      for (int hh = 0; hh < 2; ++hh) {
+        const int head = mt * 16 + g + 8 * hh;
+        const float den = hden[head];
+        __nv_bfloat16* dst = partial + group_partial + ((int64_t)r * 32 + head) * LD;
+#pragma unroll
+        for (int t = 0; t < 8; ++t) {
+          const int col = warp * 64 + t * 8 + 2 * q;
+          dst[col] = rb(den == 0.f ? 0.f : o[mt][t][2 * hh] / den);
+          dst[col + 1] = rb(den == 0.f ? 0.f : o[mt][t][2 * hh + 1] / den);
+        }
+      }
+    if (tid < 32) {
+      float* group_lse = reinterpret_cast<float*>(reinterpret_cast<unsigned char*>(partial) + group_byte + rows * 32 * LD * (int)sizeof(__nv_bfloat16));
+      group_lse[(int64_t)r * 32 + tid] = hden[tid] == 0.f ? -CUDART_INF_F : hmax[tid] + logf(hden[tid]);
+    }
   }
 }
 
@@ -760,14 +800,25 @@ extern "C" __global__ void __launch_bounds__(256) tf_glm53_attend_split_merge(co
       v1 += w[s * stride + d + 256] * e;
     }
   }
-  constexpr int group_row_bytes = 32 * LD * sizeof(__nv_bfloat16) + 32 * sizeof(float);
-  const int64_t group_byte = (int64_t)group * rows * group_row_bytes;
-  __nv_bfloat16* dst = partial + group_byte / (int)sizeof(__nv_bfloat16) + ((int64_t)r * 32 + head) * LD;
-  dst[d] = rb(l == 0.f ? 0.f : v0 / l);
-  dst[d + 256] = rb(l == 0.f ? 0.f : v1 / l);
-  if (d == 0) {
-    float* group_lse = reinterpret_cast<float*>(reinterpret_cast<unsigned char*>(partial) + group_byte + rows * 32 * LD * (int)sizeof(__nv_bfloat16));
-    group_lse[(int64_t)r * 32 + head] = l == 0.f ? -CUDART_INF_F : m + logf(l);
+  if (local_heads < 32) {
+    __nv_bfloat16* dst = partial + ((int64_t)r * local_heads + h) * LD;
+    dst[d] = rb(l == 0.f ? 0.f : v0 / l);
+    dst[d + 256] = rb(l == 0.f ? 0.f : v1 / l);
+    if (d == 0) {
+      const int64_t partial_bytes = (int64_t)rows * local_heads * LD * (int)sizeof(__nv_bfloat16);
+      float* group_lse = reinterpret_cast<float*>(reinterpret_cast<unsigned char*>(partial) + partial_bytes);
+      group_lse[(int64_t)r * local_heads + h] = l == 0.f ? -CUDART_INF_F : m + logf(l);
+    }
+  } else {
+    constexpr int group_row_bytes = 32 * LD * sizeof(__nv_bfloat16) + 32 * sizeof(float);
+    const int64_t group_byte = (int64_t)group * rows * group_row_bytes;
+    __nv_bfloat16* dst = partial + group_byte / (int)sizeof(__nv_bfloat16) + ((int64_t)r * 32 + head) * LD;
+    dst[d] = rb(l == 0.f ? 0.f : v0 / l);
+    dst[d + 256] = rb(l == 0.f ? 0.f : v1 / l);
+    if (d == 0) {
+      float* group_lse = reinterpret_cast<float*>(reinterpret_cast<unsigned char*>(partial) + group_byte + rows * 32 * LD * (int)sizeof(__nv_bfloat16));
+      group_lse[(int64_t)r * 32 + head] = l == 0.f ? -CUDART_INF_F : m + logf(l);
+    }
   }
 }
 
@@ -790,7 +841,7 @@ extern "C" __global__ void __launch_bounds__(256) tf_glm53_attend_verify(const _
                                             const int32_t* local_counts, float* split_ws,
                                             int rows, int local_heads, int rank, int world) {
   const int r = blockIdx.x, group = blockIdx.y, chunk = blockIdx.z, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-  if (r >= rows || group >= local_heads / 32) return;
+  if (r >= rows || group >= (local_heads + 31) / 32) return;
   extern __shared__ __align__(16) unsigned char mma_smem[];
   __nv_bfloat16* qs = reinterpret_cast<__nv_bfloat16*>(mma_smem);
   __nv_bfloat16* ks0 = qs + 32 * MMA_QS;
@@ -844,10 +895,17 @@ extern "C" __global__ void __launch_bounds__(256) tf_glm53_attend_verify(const _
     asm volatile("cp.async.commit_group;\n" ::);
   };
   meta(0, 0); __syncthreads(); fetch(0);
+  const int64_t qrow = local_heads < 32 ? (int64_t)r * local_heads : (((int64_t)group * rows + r) * 32);
   for (int x = tid; x < 32 * 72; x += 256) {
     const int h = x / 72, c = x % 72;
-    const uint4* src = c < 64 ? reinterpret_cast<const uint4*>(qa + (((int64_t)group * rows + r) * 32 + h) * LD) + c : reinterpret_cast<const uint4*>(qpe + (((int64_t)group * rows + r) * 32 + h) * PD) + (c - 64);
-    reinterpret_cast<uint4*>(qs + h * MMA_QS)[c] = *src;
+    uint4 val;
+    if (local_heads < 32 && h >= local_heads) {
+      val = make_uint4(0, 0, 0, 0);
+    } else {
+      const uint4* src = c < 64 ? reinterpret_cast<const uint4*>(qa + (qrow + h) * LD) + c : reinterpret_cast<const uint4*>(qpe + (qrow + h) * PD) + (c - 64);
+      val = *src;
+    }
+    reinterpret_cast<uint4*>(qs + h * MMA_QS)[c] = val;
   }
   if (tid < 32) { hmax[tid] = -CUDART_INF_F; hden[tid] = 0.f; }
   const int g = lane >> 2, q = lane & 3;
@@ -975,7 +1033,7 @@ extern "C" __global__ void __launch_bounds__(SMLA_THREADS, 1) tf_glm53_smla_p(co
   (void)local_slots; (void)local_counts; (void)dense_len;
   const int row0 = blockIdx.x * SMLA_QB, group = blockIdx.y, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   if (prefill == 0) __trap();
-  if (row0 >= rows || group >= local_heads / 32) return;
+  if (row0 >= rows || group >= (local_heads + 31) / 32) return;
   extern __shared__ __align__(16) unsigned char smla_smem[];
   __nv_bfloat16* kbuf = reinterpret_cast<__nv_bfloat16*>(smla_smem + SMLA_OFF_K);
   __nv_bfloat16* kzero = reinterpret_cast<__nv_bfloat16*>(smla_smem + SMLA_OFF_Z);
@@ -1012,16 +1070,26 @@ extern "C" __global__ void __launch_bounds__(SMLA_THREADS, 1) tf_glm53_smla_p(co
   uint32_t qf[SMLA_KSTEPS][4];
   {
     const int r = row0 + sb;
-    const int64_t qh0 = ((int64_t)group * rows + r) * 32 + (smt & 1) * 16 + g;
+    const int head_base = (smt & 1) * 16 + g;
 #pragma unroll
     for (int st = 0; st < SMLA_KSTEPS; ++st) {
       const int k0 = (kq * SMLA_KSTEPS + st) * 16 + 2 * q;
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
-        const int64_t qr = qh0 + 8 * (i & 1);
+        const int h = head_base + 8 * (i & 1);
         const int kk = k0 + 8 * (i >> 1);
         uint32_t v = 0u;
-        if (r < rows) v = kk < LD ? smla_ld32(qa + qr * LD + kk) : smla_ld32(qpe + qr * PD + (kk - LD));
+        if (r < rows) {
+          if (local_heads < 32) {
+            if (h < local_heads) {
+              const int64_t qr = (int64_t)r * local_heads + h;
+              v = kk < LD ? smla_ld32(qa + qr * LD + kk) : smla_ld32(qpe + qr * PD + (kk - LD));
+            }
+          } else {
+            const int64_t qr = ((int64_t)group * rows + r) * 32 + h;
+            v = kk < LD ? smla_ld32(qa + qr * LD + kk) : smla_ld32(qpe + qr * PD + (kk - LD));
+          }
+        }
         qf[st][i] = v;
       }
     }
@@ -1199,30 +1267,62 @@ extern "C" __global__ void __launch_bounds__(SMLA_THREADS, 1) tf_glm53_smla_p(co
     }
   }
   __syncthreads();
-  constexpr int group_row_bytes = 32 * LD * sizeof(__nv_bfloat16) + 32 * sizeof(float);
-  const int64_t group_byte = (int64_t)group * rows * group_row_bytes;
-  const int64_t group_partial = group_byte / (int)sizeof(__nv_bfloat16);
-  const int c0 = warp * 32;
+  if (local_heads < 32) {
+    const int64_t partial_bytes = (int64_t)rows * local_heads * LD * (int)sizeof(__nv_bfloat16);
+    float* group_lse = reinterpret_cast<float*>(reinterpret_cast<unsigned char*>(partial) + partial_bytes);
+    const int c0 = warp * 32;
 #pragma unroll
-  for (int mt = 0; mt < 2 * SMLA_QB; ++mt) {
-    const int r = row0 + (mt >> 1);
-    if (r >= rows) continue;
+    for (int mt = 0; mt < 2 * SMLA_QB; ++mt) {
+      const int r = row0 + (mt >> 1);
+      if (r >= rows) continue;
 #pragma unroll
-    for (int hh = 0; hh < 2; ++hh) {
-      const int head = (mt & 1) * 16 + g + 8 * hh;
-      const float den = hden[mt * 16 + g + 8 * hh];
-      __nv_bfloat16* dst = partial + group_partial + ((int64_t)r * 32 + head) * LD;
+      for (int hh = 0; hh < 2; ++hh) {
+        const int head = (mt & 1) * 16 + g + 8 * hh;
+        if (head < local_heads) {
+          const float den = hden[mt * 16 + g + 8 * hh];
+          __nv_bfloat16* dst = partial + ((int64_t)r * local_heads + head) * LD;
 #pragma unroll
-      for (int nt = 0; nt < 4; ++nt) {
-        const int col = c0 + nt * 8 + 2 * q;
-        dst[col] = rb(den == 0.f ? 0.f : o[mt][nt][2 * hh] / den);
-        dst[col + 1] = rb(den == 0.f ? 0.f : o[mt][nt][2 * hh + 1] / den);
+          for (int nt = 0; nt < 4; ++nt) {
+            const int col = c0 + nt * 8 + 2 * q;
+            dst[col] = rb(den == 0.f ? 0.f : o[mt][nt][2 * hh] / den);
+            dst[col + 1] = rb(den == 0.f ? 0.f : o[mt][nt][2 * hh + 1] / den);
+          }
+        }
       }
     }
-  }
-  if (tid < SMLA_MH && row0 + (tid >> 5) < rows) {
-    float* group_lse = reinterpret_cast<float*>(reinterpret_cast<unsigned char*>(partial) + group_byte + rows * 32 * LD * (int)sizeof(__nv_bfloat16));
-    group_lse[(int64_t)(row0 + (tid >> 5)) * 32 + (tid & 31)] = hden[tid] == 0.f ? -CUDART_INF_F : hmax[tid] + logf(hden[tid]);
+    if (tid < SMLA_MH) {
+      const int r = row0 + (tid >> 5);
+      const int head = tid & 31;
+      if (r < rows && head < local_heads) {
+        group_lse[(int64_t)r * local_heads + head] = hden[tid] == 0.f ? -CUDART_INF_F : hmax[tid] + logf(hden[tid]);
+      }
+    }
+  } else {
+    constexpr int group_row_bytes = 32 * LD * sizeof(__nv_bfloat16) + 32 * sizeof(float);
+    const int64_t group_byte = (int64_t)group * rows * group_row_bytes;
+    const int64_t group_partial = group_byte / (int)sizeof(__nv_bfloat16);
+    const int c0 = warp * 32;
+#pragma unroll
+    for (int mt = 0; mt < 2 * SMLA_QB; ++mt) {
+      const int r = row0 + (mt >> 1);
+      if (r >= rows) continue;
+#pragma unroll
+      for (int hh = 0; hh < 2; ++hh) {
+        const int head = (mt & 1) * 16 + g + 8 * hh;
+        const float den = hden[mt * 16 + g + 8 * hh];
+        __nv_bfloat16* dst = partial + group_partial + ((int64_t)r * 32 + head) * LD;
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+          const int col = c0 + nt * 8 + 2 * q;
+          dst[col] = rb(den == 0.f ? 0.f : o[mt][nt][2 * hh] / den);
+          dst[col + 1] = rb(den == 0.f ? 0.f : o[mt][nt][2 * hh + 1] / den);
+        }
+      }
+    }
+    if (tid < SMLA_MH && row0 + (tid >> 5) < rows) {
+      float* group_lse = reinterpret_cast<float*>(reinterpret_cast<unsigned char*>(partial) + group_byte + rows * 32 * LD * (int)sizeof(__nv_bfloat16));
+      group_lse[(int64_t)(row0 + (tid >> 5)) * 32 + (tid & 31)] = hden[tid] == 0.f ? -CUDART_INF_F : hmax[tid] + logf(hden[tid]);
+    }
   }
 }
 
@@ -1352,7 +1452,7 @@ extern "C" __global__ void __launch_bounds__(SMLA_THREADS, 1) tf_glm53_smla_p3(c
   // Longest-first: dense pieces have rising list lengths along the rows, so the last pairs start first.
   const int row0 = (int)(gridDim.x - 1 - blockIdx.x) * SMLA_QB, group = blockIdx.y, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   if (prefill == 0) __trap();
-  if (row0 >= rows || group >= local_heads / 32) return;
+  if (row0 >= rows || group >= (local_heads + 31) / 32) return;
   extern __shared__ __align__(16) unsigned char smla_smem[];
   __nv_bfloat16* kbuf = reinterpret_cast<__nv_bfloat16*>(smla_smem + SMLA3_OFF_K);
   __nv_bfloat16* kzero = reinterpret_cast<__nv_bfloat16*>(smla_smem + SMLA3_OFF_Z);
@@ -1387,16 +1487,26 @@ extern "C" __global__ void __launch_bounds__(SMLA_THREADS, 1) tf_glm53_smla_p3(c
   uint32_t qf[SMLA_KSTEPS][4];
   {
     const int r = row0 + sb;
-    const int64_t qh0 = ((int64_t)group * rows + r) * 32 + (smt & 1) * 16 + g;
+    const int head_base = (smt & 1) * 16 + g;
 #pragma unroll
     for (int st = 0; st < SMLA_KSTEPS; ++st) {
       const int k0 = (kq * SMLA_KSTEPS + st) * 16 + 2 * q;
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
-        const int64_t qr = qh0 + 8 * (i & 1);
+        const int h = head_base + 8 * (i & 1);
         const int kk = k0 + 8 * (i >> 1);
         uint32_t v = 0u;
-        if (r < rows) v = kk < LD ? smla_ld32(qa + qr * LD + kk) : smla_ld32(qpe + qr * PD + (kk - LD));
+        if (r < rows) {
+          if (local_heads < 32) {
+            if (h < local_heads) {
+              const int64_t qr = (int64_t)r * local_heads + h;
+              v = kk < LD ? smla_ld32(qa + qr * LD + kk) : smla_ld32(qpe + qr * PD + (kk - LD));
+            }
+          } else {
+            const int64_t qr = ((int64_t)group * rows + r) * 32 + h;
+            v = kk < LD ? smla_ld32(qa + qr * LD + kk) : smla_ld32(qpe + qr * PD + (kk - LD));
+          }
+        }
         qf[st][i] = v;
       }
     }
@@ -1554,29 +1664,58 @@ extern "C" __global__ void __launch_bounds__(SMLA_THREADS, 1) tf_glm53_smla_p3(c
     }
   }
   __syncthreads();
-  constexpr int group_row_bytes = 32 * LD * sizeof(__nv_bfloat16) + 32 * sizeof(float);
-  const int64_t group_byte = (int64_t)group * rows * group_row_bytes;
-  const int64_t group_partial = group_byte / (int)sizeof(__nv_bfloat16);
-  {
+  if (local_heads < 32) {
+    const int64_t partial_bytes = (int64_t)rows * local_heads * LD * (int)sizeof(__nv_bfloat16);
+    float* group_lse = reinterpret_cast<float*>(reinterpret_cast<unsigned char*>(partial) + partial_bytes);
     const int r = row0 + sb;
     if (r < rows) {
 #pragma unroll
       for (int hh = 0; hh < 2; ++hh) {
         const int head = (smt & 1) * 16 + g + 8 * hh;
-        const float den = hden[smt * 16 + g + 8 * hh];
-        __nv_bfloat16* dst = partial + group_partial + ((int64_t)r * 32 + head) * LD;
+        if (head < local_heads) {
+          const float den = hden[smt * 16 + g + 8 * hh];
+          __nv_bfloat16* dst = partial + ((int64_t)r * local_heads + head) * LD;
 #pragma unroll
-        for (int nt = 0; nt < SMLA3_PV_NT; ++nt) {
-          const int col = pc * SMLA3_PV_COLS + nt * 8 + 2 * q;
-          dst[col] = rb(den == 0.f ? 0.f : o[nt][2 * hh] / den);
-          dst[col + 1] = rb(den == 0.f ? 0.f : o[nt][2 * hh + 1] / den);
+          for (int nt = 0; nt < SMLA3_PV_NT; ++nt) {
+            const int col = pc * SMLA3_PV_COLS + nt * 8 + 2 * q;
+            dst[col] = rb(den == 0.f ? 0.f : o[nt][2 * hh] / den);
+            dst[col + 1] = rb(den == 0.f ? 0.f : o[nt][2 * hh + 1] / den);
+          }
         }
       }
     }
-  }
-  if (tid < SMLA_MH && row0 + (tid >> 5) < rows) {
-    float* group_lse = reinterpret_cast<float*>(reinterpret_cast<unsigned char*>(partial) + group_byte + rows * 32 * LD * (int)sizeof(__nv_bfloat16));
-    group_lse[(int64_t)(row0 + (tid >> 5)) * 32 + (tid & 31)] = hden[tid] == 0.f ? -CUDART_INF_F : hmax[tid] + logf(hden[tid]);
+    if (tid < SMLA_MH) {
+      const int r_lse = row0 + (tid >> 5);
+      const int head = tid & 31;
+      if (r_lse < rows && head < local_heads) {
+        group_lse[(int64_t)r_lse * local_heads + head] = hden[tid] == 0.f ? -CUDART_INF_F : hmax[tid] + logf(hden[tid]);
+      }
+    }
+  } else {
+    constexpr int group_row_bytes = 32 * LD * sizeof(__nv_bfloat16) + 32 * sizeof(float);
+    const int64_t group_byte = (int64_t)group * rows * group_row_bytes;
+    const int64_t group_partial = group_byte / (int)sizeof(__nv_bfloat16);
+    {
+      const int r = row0 + sb;
+      if (r < rows) {
+#pragma unroll
+        for (int hh = 0; hh < 2; ++hh) {
+          const int head = (smt & 1) * 16 + g + 8 * hh;
+          const float den = hden[smt * 16 + g + 8 * hh];
+          __nv_bfloat16* dst = partial + group_partial + ((int64_t)r * 32 + head) * LD;
+#pragma unroll
+          for (int nt = 0; nt < SMLA3_PV_NT; ++nt) {
+            const int col = pc * SMLA3_PV_COLS + nt * 8 + 2 * q;
+            dst[col] = rb(den == 0.f ? 0.f : o[nt][2 * hh] / den);
+            dst[col + 1] = rb(den == 0.f ? 0.f : o[nt][2 * hh + 1] / den);
+          }
+        }
+      }
+    }
+    if (tid < SMLA_MH && row0 + (tid >> 5) < rows) {
+      float* group_lse = reinterpret_cast<float*>(reinterpret_cast<unsigned char*>(partial) + group_byte + rows * 32 * LD * (int)sizeof(__nv_bfloat16));
+      group_lse[(int64_t)(row0 + (tid >> 5)) * 32 + (tid & 31)] = hden[tid] == 0.f ? -CUDART_INF_F : hmax[tid] + logf(hden[tid]);
+    }
   }
 }
 
@@ -1687,7 +1826,7 @@ extern "C" __global__ void __launch_bounds__(SMLA_THREADS, 1) tf_glm53_smla_p_fp
   (void)local_slots; (void)local_counts; (void)dense_len;
   const int row0 = blockIdx.x * SMLA_QB, group = blockIdx.y, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   if (prefill == 0) __trap();
-  if (row0 >= rows || group >= local_heads / 32) return;
+  if (row0 >= rows || group >= (local_heads + 31) / 32) return;
   extern __shared__ __align__(16) unsigned char smf_smem[];
   __nv_bfloat16* vbuf = reinterpret_cast<__nv_bfloat16*>(smf_smem + SMF_OFF_V);
   __nv_bfloat16* rbuf = reinterpret_cast<__nv_bfloat16*>(smf_smem + SMF_OFF_R);
@@ -1725,10 +1864,10 @@ extern "C" __global__ void __launch_bounds__(SMLA_THREADS, 1) tf_glm53_smla_p_fp
   // and rope dims 2 lane, 2 lane + 1.
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
-    const int qh = warp * 4 + i, r = row0 + (qh >> 5);
+    const int qh = warp * 4 + i, r = row0 + (qh >> 5), h = qh & 31;
     float amax = 0.f;
-    if (r < rows) {
-      const int64_t qr = ((int64_t)group * rows + r) * 32 + (qh & 31);
+    if (r < rows && (local_heads >= 32 || h < local_heads)) {
+      const int64_t qr = local_heads < 32 ? (int64_t)r * local_heads + h : (((int64_t)group * rows + r) * 32 + h);
       const uint4* lat = reinterpret_cast<const uint4*>(qa + qr * LD + 16 * lane);
       amax = smf_amax18(lat[0], lat[1], smla_ld32(qpe + qr * PD + 2 * lane));
     }
@@ -1744,19 +1883,28 @@ extern "C" __global__ void __launch_bounds__(SMLA_THREADS, 1) tf_glm53_smla_p_fp
   uint32_t qf[SMF_KSTEPS][4];
   {
     const int r = row0 + sb;
-    const int64_t qh0 = ((int64_t)group * rows + r) * 32 + (smt & 1) * 16 + g;
+    const int head_base = (smt & 1) * 16 + g;
     const float inv0 = __frcp_rn(qsc[smt * 16 + g]), inv1 = __frcp_rn(qsc[smt * 16 + g + 8]);
 #pragma unroll
     for (int st = 0; st < SMF_KSTEPS; ++st) {
       const int k0 = (kh * SMF_KSTEPS + st) * 32 + 4 * q;
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
-        const int64_t qr = qh0 + 8 * (i & 1);
+        const int h = head_base + 8 * (i & 1);
         const int kk = k0 + 16 * (i >> 1);
         uint32_t v = 0u;
         if (r < rows) {
-          const uint2 x = kk < LD ? *reinterpret_cast<const uint2*>(qa + qr * LD + kk) : *reinterpret_cast<const uint2*>(qpe + qr * PD + (kk - LD));
-          v = smf_e4m3x4(x.x, x.y, (i & 1) ? inv1 : inv0);
+          if (local_heads < 32) {
+            if (h < local_heads) {
+              const int64_t qr = (int64_t)r * local_heads + h;
+              const uint2 x = kk < LD ? *reinterpret_cast<const uint2*>(qa + qr * LD + kk) : *reinterpret_cast<const uint2*>(qpe + qr * PD + (kk - LD));
+              v = smf_e4m3x4(x.x, x.y, (i & 1) ? inv1 : inv0);
+            }
+          } else {
+            const int64_t qr = ((int64_t)group * rows + r) * 32 + h;
+            const uint2 x = kk < LD ? *reinterpret_cast<const uint2*>(qa + qr * LD + kk) : *reinterpret_cast<const uint2*>(qpe + qr * PD + (kk - LD));
+            v = smf_e4m3x4(x.x, x.y, (i & 1) ? inv1 : inv0);
+          }
         }
         qf[st][i] = v;
       }
@@ -1950,30 +2098,62 @@ extern "C" __global__ void __launch_bounds__(SMLA_THREADS, 1) tf_glm53_smla_p_fp
     }
   }
   __syncthreads();
-  constexpr int group_row_bytes = 32 * LD * sizeof(__nv_bfloat16) + 32 * sizeof(float);
-  const int64_t group_byte = (int64_t)group * rows * group_row_bytes;
-  const int64_t group_partial = group_byte / (int)sizeof(__nv_bfloat16);
-  const int c0 = warp * 32;
+  if (local_heads < 32) {
+    const int64_t partial_bytes = (int64_t)rows * local_heads * LD * (int)sizeof(__nv_bfloat16);
+    float* group_lse = reinterpret_cast<float*>(reinterpret_cast<unsigned char*>(partial) + partial_bytes);
+    const int c0 = warp * 32;
 #pragma unroll
-  for (int mt = 0; mt < 2 * SMLA_QB; ++mt) {
-    const int r = row0 + (mt >> 1);
-    if (r >= rows) continue;
+    for (int mt = 0; mt < 2 * SMLA_QB; ++mt) {
+      const int r = row0 + (mt >> 1);
+      if (r >= rows) continue;
 #pragma unroll
-    for (int hh = 0; hh < 2; ++hh) {
-      const int head = (mt & 1) * 16 + g + 8 * hh;
-      const float den = hden[mt * 16 + g + 8 * hh];
-      __nv_bfloat16* dst = partial + group_partial + ((int64_t)r * 32 + head) * LD;
+      for (int hh = 0; hh < 2; ++hh) {
+        const int head = (mt & 1) * 16 + g + 8 * hh;
+        if (head < local_heads) {
+          const float den = hden[mt * 16 + g + 8 * hh];
+          __nv_bfloat16* dst = partial + ((int64_t)r * local_heads + head) * LD;
 #pragma unroll
-      for (int nt4 = 0; nt4 < 4; ++nt4) {
-        const int col = c0 + nt4 * 8 + 2 * q;
-        dst[col] = rb(den == 0.f ? 0.f : o[mt][nt4][2 * hh] / den);
-        dst[col + 1] = rb(den == 0.f ? 0.f : o[mt][nt4][2 * hh + 1] / den);
+          for (int nt4 = 0; nt4 < 4; ++nt4) {
+            const int col = c0 + nt4 * 8 + 2 * q;
+            dst[col] = rb(den == 0.f ? 0.f : o[mt][nt4][2 * hh] / den);
+            dst[col + 1] = rb(den == 0.f ? 0.f : o[mt][nt4][2 * hh + 1] / den);
+          }
+        }
       }
     }
-  }
-  if (tid < SMLA_MH && row0 + (tid >> 5) < rows) {
-    float* group_lse = reinterpret_cast<float*>(reinterpret_cast<unsigned char*>(partial) + group_byte + rows * 32 * LD * (int)sizeof(__nv_bfloat16));
-    group_lse[(int64_t)(row0 + (tid >> 5)) * 32 + (tid & 31)] = hden[tid] == 0.f ? -CUDART_INF_F : hmax[tid] + logf(hden[tid]);
+    if (tid < SMLA_MH) {
+      const int r_lse = row0 + (tid >> 5);
+      const int head = tid & 31;
+      if (r_lse < rows && head < local_heads) {
+        group_lse[(int64_t)r_lse * local_heads + head] = hden[tid] == 0.f ? -CUDART_INF_F : hmax[tid] + logf(hden[tid]);
+      }
+    }
+  } else {
+    constexpr int group_row_bytes = 32 * LD * sizeof(__nv_bfloat16) + 32 * sizeof(float);
+    const int64_t group_byte = (int64_t)group * rows * group_row_bytes;
+    const int64_t group_partial = group_byte / (int)sizeof(__nv_bfloat16);
+    const int c0 = warp * 32;
+#pragma unroll
+    for (int mt = 0; mt < 2 * SMLA_QB; ++mt) {
+      const int r = row0 + (mt >> 1);
+      if (r >= rows) continue;
+#pragma unroll
+      for (int hh = 0; hh < 2; ++hh) {
+        const int head = (mt & 1) * 16 + g + 8 * hh;
+        const float den = hden[mt * 16 + g + 8 * hh];
+        __nv_bfloat16* dst = partial + group_partial + ((int64_t)r * 32 + head) * LD;
+#pragma unroll
+        for (int nt4 = 0; nt4 < 4; ++nt4) {
+          const int col = c0 + nt4 * 8 + 2 * q;
+          dst[col] = rb(den == 0.f ? 0.f : o[mt][nt4][2 * hh] / den);
+          dst[col + 1] = rb(den == 0.f ? 0.f : o[mt][nt4][2 * hh + 1] / den);
+        }
+      }
+    }
+    if (tid < SMLA_MH && row0 + (tid >> 5) < rows) {
+      float* group_lse = reinterpret_cast<float*>(reinterpret_cast<unsigned char*>(partial) + group_byte + rows * 32 * LD * (int)sizeof(__nv_bfloat16));
+      group_lse[(int64_t)(row0 + (tid >> 5)) * 32 + (tid & 31)] = hden[tid] == 0.f ? -CUDART_INF_F : hmax[tid] + logf(hden[tid]);
+    }
   }
 }
 

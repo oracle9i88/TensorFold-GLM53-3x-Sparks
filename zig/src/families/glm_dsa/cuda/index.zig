@@ -503,7 +503,7 @@ pub const Index = struct {
     /// Merge rank-major packed candidates and fuse sparse filter plus owner-slot remap.
     pub fn merge(k: *const Index, stream: cuda.Stream, candidate_records: u64, global: u64, global_counts: u64, out: u64, counts: u64, positions: u64, rank: usize, world: usize, rows: usize, topk_count: usize) !void {
         if (rows == 0) return;
-        if (topk_count == 0 or topk_count > top_k or world != 2 or rank >= world) return error.DcpShape;
+        if (topk_count == 0 or topk_count > top_k or (world != 1 and world != 2) or rank >= world) return error.DcpShape;
         var a: cuda.Args = .{};
         a.add(candidate_records);
         a.add(global);
@@ -521,7 +521,7 @@ pub const Index = struct {
     /// Exact linear merge. block_rows describes the per-gather row tile in block-major index-pipe storage.
     pub fn merge2(k: *const Index, stream: cuda.Stream, candidate_records: u64, global: u64, global_counts: u64, out: u64, counts: u64, positions: u64, rank: usize, world: usize, rows: usize, topk_count: usize, block_rows: usize) !void {
         if (rows == 0) return;
-        if (topk_count == 0 or topk_count > top_k or world != 2 or rank >= world or block_rows == 0) return error.DcpShape;
+        if (topk_count == 0 or topk_count > top_k or (world != 1 and world != 2) or rank >= world or block_rows == 0) return error.DcpShape;
         var a: cuda.Args = .{};
         a.add(candidate_records);
         a.add(global);

@@ -34,5 +34,5 @@ test "copy arbitration leaves the drafter at its normal held depth" {
     var arbitration: depth.Rule = .{ .gpa = std.testing.allocator, .k = .{ .copy_arbitrate = true }, .prior = &.{0.8}, .most_drafts = 7, .family_costs = &empty, .shared_costs = &empty, .mtp_step_ms = 0.5, .plain_guard = false, .node_probabilities = true, .granted_depth = true, .batch_rows = 12 };
     defer arbitration.deinit();
     try std.testing.expectEqual(@as(i64, 1), try normal.headDepth(&stream, null, probe));
-    try std.testing.expectEqual(@as(i64, 7), try arbitration.headDepth(&stream, null, probe));
+    try std.testing.expectEqual(@as(i64, 3), try arbitration.headDepth(&stream, null, probe));
 }

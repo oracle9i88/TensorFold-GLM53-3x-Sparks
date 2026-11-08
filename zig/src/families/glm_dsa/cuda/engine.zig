@@ -192,6 +192,7 @@ const DraftFill = union(enum) { restart: usize, prompt: struct { start: usize, r
 pub const Engine = struct {
     gpa: std.mem.Allocator,
     io: ?std.Io = null,
+    world: usize = 2,
     f: forward.Forward,
     mem: uma.MemTrace = .{},
     decode_graph_max: u32 = 48,
@@ -297,7 +298,7 @@ pub const Engine = struct {
             e.gpa.free(e.fallback_log_z);
             e.fallback_log_z = next;
         }
-        const full_vocab = e.f.w.vocab.len() * forward.world;
+        const full_vocab = e.f.w.config.vocab;
         e.fallback_vocab = full_vocab;
         const logits_count = try std.math.mul(usize, rows, full_vocab);
         if (e.fallback_logits_host.len < logits_count) {
@@ -305,8 +306,9 @@ pub const Engine = struct {
             e.gpa.free(e.fallback_logits_host);
             e.fallback_logits_host = next;
         }
-        const local_bytes = try std.math.mul(usize, e.f.w.vocab.len(), @sizeOf(f32));
-        const fallback_bytes = try std.math.mul(usize, local_bytes, 3);
+        const max_shard = if (e.world == 3) @as(usize, 51712) else (full_vocab / e.world);
+        const max_shard_bytes = try std.math.mul(usize, max_shard, @sizeOf(f32));
+        const fallback_bytes = max_shard_bytes + max_shard_bytes * e.world;
         if (e.fallback_device == null or e.fallback_device.?.len < fallback_bytes) {
             if (e.fallback_device) |*buffer| buffer.free();
             e.fallback_device = try cuda.DeviceBuffer.alloc(e.f.stream.d, fallback_bytes);
@@ -447,7 +449,7 @@ pub const Engine = struct {
     pub fn reserveSteadyState(e: *Engine) !void {
         const sampled_head: forward.HeadMode = .{ .candidates = e.f.st.ws.candidate_k };
         const max_head_bytes = try std.math.mul(usize, e.f.st.ws.head_rows, sampled_head.rowBytes());
-        const gathered_bytes = try std.math.mul(usize, max_head_bytes, forward.world);
+        const gathered_bytes = try std.math.mul(usize, max_head_bytes, e.world);
         if (e.head_host.len < gathered_bytes) {
             const next = try e.gpa.alloc(u8, gathered_bytes);
             e.gpa.free(e.head_host);
@@ -484,7 +486,7 @@ pub const Engine = struct {
 
     fn readHead(e: *Engine, stream: cuda.Stream, gathered: u64, rows: usize, per_rank: usize) !void {
         e.head_masked = e.mask_rows != 0;
-        const n = per_rank * forward.world;
+        const n = per_rank * e.world;
         if (e.head_host.len < n) {
             e.gpa.free(e.head_host);
             e.head_host = &.{};
@@ -527,10 +529,10 @@ pub const Engine = struct {
         const k = switch (e.f.head) { .candidates => |width| width, .none, .greedy => return error.NoCandidateHead };
         const per = e.head_per_rank;
         const n = e.head_rows;
-        var lists: [forward.world][]const sampler.Candidate = undefined;
+        var lists: [3][]const sampler.Candidate = undefined;
         var made: usize = 0;
         defer for (lists[0..made]) |list| e.gpa.free(list.ptr[0..k]);
-        for (0..forward.world) |rank| {
+        for (0..e.world) |rank| {
             const base = e.head_host[rank * per ..];
             const list = try e.gpa.alloc(sampler.Candidate, k);
             var len: usize = 0;
@@ -546,10 +548,10 @@ pub const Engine = struct {
             lists[rank] = list[0..len];
             made += 1;
         }
-        const merged = try sampler.mergeCandidates(e.gpa, &lists, k);
+        const merged = try sampler.mergeCandidates(e.gpa, lists[0..e.world], k);
         defer e.gpa.free(merged);
-        var rank_lse: [forward.world]sampler.Lse = undefined;
-        for (0..forward.world) |rank| {
+        var rank_lse: [3]sampler.Lse = undefined;
+        for (0..e.world) |rank| {
             const base = e.head_host[rank * per ..];
             const at = n * k * 8 + row * 8;
             rank_lse[rank] = .{
@@ -557,21 +559,37 @@ pub const Engine = struct {
                 .sum = std.mem.bytesToValue(f32, base[at + 4 ..][0..4]),
             };
         }
-        const log_z = sampler.mergeLse(&rank_lse);
+        const log_z = sampler.mergeLse(rank_lse[0..e.world]);
         return .{ .fits = try nucleusFitsCandidates(e.gpa, merged, log_z, e.rule), .log_z = log_z };
     }
 
     fn fetchFullLogitsRow(e: *Engine, stream: cuda.Stream, row: usize) !void {
         const device = e.fallback_device orelse return error.MissingFallbackBuffer;
+        const full_vocab = e.f.w.config.vocab;
         const vocab_local = e.f.w.vocab.len();
         const local_bytes = try std.math.mul(usize, vocab_local, @sizeOf(f32));
-        const output = device.ptr + local_bytes;
+        const max_shard = if (e.world == 3) @as(usize, 51712) else (full_vocab / e.world);
+        const max_shard_bytes = max_shard * @sizeOf(f32);
+
+        const send_buf = device.ptr;
+        const gathered_buf = device.ptr + max_shard_bytes;
         const source = e.f.st.ws.logits + row * local_bytes;
-        try stream.d.check(stream.d.api.cuMemcpyDtoDAsync_v2(device.ptr, source, local_bytes, stream.handle), "copy full-vocabulary fallback logits");
-        try e.f.coll.allGather(stream, device.ptr, output, local_bytes, .head);
-        const full_vocab = vocab_local * forward.world;
-        const host = e.fallback_logits_host[row * full_vocab ..][0..full_vocab];
-        try e.download.download_fn(e.download.ctx, stream, output, std.mem.sliceAsBytes(host));
+
+        try stream.d.check(stream.d.api.cuMemcpyDtoDAsync_v2(send_buf, source, local_bytes, stream.handle), "copy full-vocabulary fallback logits");
+        if (local_bytes < max_shard_bytes) {
+            try stream.d.check(stream.d.api.cuMemsetD8Async(send_buf + local_bytes, 0, max_shard_bytes - local_bytes, stream.handle), "zero-pad fallback logits tail");
+        }
+
+        try e.f.coll.allGather(stream, send_buf, gathered_buf, max_shard_bytes, .head);
+
+        const host_row = e.fallback_logits_host[row * full_vocab ..][0..full_vocab];
+        for (0..e.world) |rank| {
+            const span_start: usize = if (e.world == 3) (switch (rank) { 0 => 0, 1 => 51712, else => 103296 }) else rank * (full_vocab / e.world);
+            const span_end: usize = if (e.world == 3) (switch (rank) { 0 => 51712, 1 => 103296, else => 154880 }) else (rank + 1) * (full_vocab / e.world);
+            const dev_offset = gathered_buf + rank * max_shard_bytes;
+            const host_dest = host_row[span_start..span_end];
+            try e.download.download_fn(e.download.ctx, stream, dev_offset, std.mem.sliceAsBytes(host_dest));
+        }
     }
 
     pub fn setMasks(e: *Engine, bits: []const u32, rows: usize) !void {
@@ -980,7 +998,7 @@ pub const Engine = struct {
         defer e.graphs = cache;
         try e.verify(ids, out[0..rows]);
         try e.download.download_fn(e.download.ctx, e.f.stream, e.f.st.ws.logits, live);
-        const head = try e.gpa.dupe(u8, e.head_host[0 .. e.head_per_rank * forward.world]);
+        const head = try e.gpa.dupe(u8, e.head_host[0 .. e.head_per_rank * e.world]);
         defer e.gpa.free(head);
         const tokens = out;
         e.graphs = cache;
@@ -1072,7 +1090,7 @@ pub const Engine = struct {
             .none => return error.NoHead,
             .greedy => {
                 var best: ?sampler.Candidate = null;
-                for (0..forward.world) |rank| {
+                for (0..e.world) |rank| {
                     const base = e.head_host[rank * e.head_per_rank ..];
                     const value = std.mem.bytesToValue(f32, base[row * 4 ..][0..4]);
                     const id = std.mem.readInt(u32, base[n * 4 + row * 4 ..][0..4], .little);
@@ -1084,10 +1102,10 @@ pub const Engine = struct {
                 return best.?.id;
             },
             .candidates => |k| {
-                var lists: [forward.world][]const sampler.Candidate = undefined;
+                var lists: [3][]const sampler.Candidate = undefined;
                 var made: usize = 0;
                 defer for (lists[0..made]) |list| e.gpa.free(list.ptr[0..k]);
-                for (0..forward.world) |rank| {
+                for (0..e.world) |rank| {
                     const base = e.head_host[rank * e.head_per_rank ..];
                     const list = try e.gpa.alloc(sampler.Candidate, k);
                     var len: usize = 0;
@@ -1100,28 +1118,39 @@ pub const Engine = struct {
                     lists[rank] = list[0..len];
                     made += 1;
                 }
-                const merged = try sampler.mergeCandidates(e.gpa, &lists, k);
+                const merged = try sampler.mergeCandidates(e.gpa, lists[0..e.world], k);
                 defer e.gpa.free(merged);
                 if (e.rule.top_k == 0 and e.rule.top_p < 1) {
-                    if (e.rule.temperature != 1) return error.UnsupportedExactNucleusTemperature;
-                    var rank_lse: [forward.world]sampler.Lse = undefined;
-                    for (0..forward.world) |rank| {
-                        const base = e.head_host[rank * e.head_per_rank ..];
-                        const at = n * k * 8 + row * 8;
-                        rank_lse[rank] = .{ .max = std.mem.bytesToValue(f32, base[at..][0..4]), .sum = std.mem.bytesToValue(f32, base[at + 4 ..][0..4]) };
-
+                    if (e.rule.temperature == 1) {
+                        var rank_lse: [3]sampler.Lse = undefined;
+                        for (0..e.world) |rank| {
+                            const base = e.head_host[rank * e.head_per_rank ..];
+                            const at = n * k * 8 + row * 8;
+                            rank_lse[rank] = .{ .max = std.mem.bytesToValue(f32, base[at..][0..4]), .sum = std.mem.bytesToValue(f32, base[at + 4 ..][0..4]) };
+                        }
+                        const log_z = sampler.mergeLse(rank_lse[0..e.world]);
+                        var force_full = false;
+                        if (e.usesFallbackRows()) {
+                            if (row >= e.fallback_rows.len or row >= e.fallback_log_z.len) return error.FallbackRowsTooSmall;
+                            force_full = e.fallback_rows[row];
+                        }
+                        if (force_full and e.fallback_vocab == 0) return error.MissingFallbackVocabulary;
+                        const full_logits = if (e.fallback_vocab == 0) &.{} else e.fallback_logits_host[row * e.fallback_vocab ..][0..e.fallback_vocab];
+                        return drawNucleusWithFallback(e.gpa, merged, full_logits, force_full, log_z, e.seed, position, e.rule);
                     }
-                    const log_z = sampler.mergeLse(&rank_lse);
-                    var force_full = false;
                     if (e.usesFallbackRows()) {
-                        if (row >= e.fallback_rows.len or row >= e.fallback_log_z.len) return error.FallbackRowsTooSmall;
-                        force_full = e.fallback_rows[row];
+                        const full_logits = if (e.fallback_vocab == 0) &.{} else e.fallback_logits_host[row * e.fallback_vocab ..][0..e.fallback_vocab];
+                        if (full_logits.len > 0) return drawFullNucleusFromLogits(e.gpa, full_logits, 0, e.seed, position, e.rule);
                     }
-                    if (force_full and e.fallback_vocab == 0) return error.MissingFallbackVocabulary;
-                    const full_logits = if (e.fallback_vocab == 0) &.{} else e.fallback_logits_host[row * e.fallback_vocab ..][0..e.fallback_vocab];
-                    return drawNucleusWithFallback(e.gpa, merged, full_logits, force_full, log_z, e.seed, position, e.rule);
+                    return e.drawCandidates(merged, position);
                 }
-                if (e.rule.top_k > 0) return e.drawCandidates(merged, position);
+                if (e.rule.top_k > 0 or e.rule.temperature > 0) {
+                    if (e.usesFallbackRows()) {
+                        const full_logits = if (e.fallback_vocab == 0) &.{} else e.fallback_logits_host[row * e.fallback_vocab ..][0..e.fallback_vocab];
+                        if (full_logits.len > 0) return drawFullNucleusFromLogits(e.gpa, full_logits, 0, e.seed, position, e.rule);
+                    }
+                    return e.drawCandidates(merged, position);
+                }
                 return error.IncompleteCandidateCoverage;
             },
         }
@@ -1306,7 +1335,8 @@ test "engine draw falls back when the full-vocabulary nucleus exceeds K" {
 
 pub fn greedyRow(head_host: []const u8, per: usize, n: usize, r: usize) ?sampler.Candidate {
     var best: ?sampler.Candidate = null;
-    for (0..forward.world) |q| {
+    const world = if (per > 0) head_host.len / per else 0;
+    for (0..world) |q| {
         const base = head_host[q * per ..];
         const v = std.mem.bytesToValue(f32, base[r * 4 ..][0..4]);
         const id = std.mem.readInt(u32, base[n * 4 + r * 4 ..][0..4], .little);
