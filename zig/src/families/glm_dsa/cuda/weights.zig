@@ -666,6 +666,94 @@ fn fp4Block(values: []const f32, g: f32, codes: []u8, lut: *const [256]f32) u8 {
     return best;
 }
 
+/// Host threads for the NVFP4 conversion: on one thread it added about 4 minutes to every load.
+const fp4_workers = 12;
+
+/// One worker's rows (r0..r1) and, for packing, 64-row word tiles (t0..t1) of linearFp8AsFp4.
+const Fp4Job = struct {
+    codes: []const u8,
+    scale: []const f32,
+    lut: *const [256]f32,
+    values: []f32,
+    nibbles: []u8,
+    block_scales: []u8,
+    packed_codes: []u8,
+    words: []u32,
+    n: usize,
+    k: usize,
+    kb: usize,
+    row0: usize,
+    col0: usize,
+    r0: usize,
+    r1: usize,
+    t0: usize = 0,
+    t1: usize = 0,
+    global: f32 = 1,
+    amax: f32 = 0,
+    err2: f64 = 0,
+    ref2: f64 = 0,
+
+    /// fp8bWeight without its per-call pow: the code's value times scale_inv, rounded to bf16.
+    fn dequant(j: *Fp4Job) void {
+        for (j.r0..j.r1) |r| for (0..j.k) |c| {
+            const v = fp8.roundBf16(j.lut[j.codes[r * j.k + c]] * j.scale[((j.row0 + r) / fp8.block) * j.kb + (j.col0 + c) / fp8.block]);
+            j.values[r * j.k + c] = v;
+            j.amax = @max(j.amax, @abs(v));
+        };
+    }
+
+    /// The rows' blocks of 16 (fp4Block), their error against the dequantized values, and their nibbles packed in
+    /// pairs (even column in the low nibble).
+    fn quantize(j: *Fp4Job) void {
+        const k = j.k;
+        for (j.r0..j.r1) |r| {
+            for (0..k / 16) |b| {
+                const at = r * k + b * 16;
+                const sb = fp4Block(j.values[at..][0..16], j.global, j.nibbles[at..][0..16], j.lut);
+                j.block_scales[r * (k / 16) + b] = sb;
+                const s = j.lut[sb] * j.global;
+                for (j.values[at..][0..16], j.nibbles[at..][0..16]) |v, c| {
+                    const d: f64 = v - e2m1Value(c) * s;
+                    j.err2 += d * d;
+                    j.ref2 += @as(f64, v) * v;
+                }
+            }
+            for (0..k / 2) |i| j.packed_codes[r * (k / 2) + i] = j.nibbles[r * k + 2 * i] | (j.nibbles[r * k + 2 * i + 1] << 4);
+        }
+    }
+
+    /// cuda.nvfp4.packWords over tiles t0..t1 only (int32 words [npad/64][k/64][8][32][2], rows past n zero).
+    fn packTiles(j: *Fp4Job) void {
+        const kg = j.k / 64;
+        const offs = [8]usize{ 0, 8, 16, 24, 1, 9, 17, 25 };
+        for (j.t0 * kg * 512..j.t1 * kg * 512) |idx| {
+            const v = idx & 1;
+            const lane = (idx >> 1) & 31;
+            const jj = (idx >> 6) & 7;
+            const tg = idx >> 9;
+            const g = tg % kg;
+            const row = (tg / kg) * 64 + jj * 8 + (lane >> 2);
+            var word: u32 = 0;
+            if (row < j.n) for (offs, 0..) |off, p| {
+                const input = g * 64 + 32 * v + 2 * (lane & 3) + off;
+                const byte = j.packed_codes[row * (j.k / 2) + input / 2];
+                const nib: u32 = if (input & 1 == 0) byte & 0xF else byte >> 4;
+                word |= nib << @intCast(4 * p);
+            };
+            j.words[idx] = word;
+        }
+    }
+};
+
+/// Run `step` over every job on its own thread and wait for them; a thread that cannot start runs its job inline.
+fn fp4Run(jobs: []Fp4Job, comptime step: fn (*Fp4Job) void) void {
+    var threads: [fp4_workers]?std.Thread = @splat(null);
+    for (jobs, 0..) |*j, i| threads[i] = std.Thread.spawn(.{}, step, .{j}) catch null;
+    for (jobs, 0..) |*j, i| {
+        if (threads[i]) |t| t.join() else step(j);
+    }
+}
+
 /// linearFp8's tensor, dequantized exactly as the FP8 lane reads it (fp8bWeight, 128x128 scale_inv blocks) and
 /// re-quantized to NVFP4 for the lane matmul (cuda.nvfp4 layout).
 fn linearFp8AsFp4(L: *Loader, name: []u8, parts: []const Part, cols: Span, n: usize, k: usize, full_cols: usize) !qmmf.Weight {
@@ -703,37 +791,38 @@ fn linearFp8AsFp4(L: *Loader, name: []u8, parts: []const Part, cols: Span, n: us
     const lut = e4m3Table();
     const values = try L.gpa.alloc(f32, n * k);
     defer L.gpa.free(values);
-    var amax: f32 = 0;
-    for (0..n) |r| for (0..k) |c| {
-        // fp8bWeight without its per-call pow: the code's value times scale_inv, rounded to bf16.
-        const v = fp8.roundBf16(lut[codes[r * k + c]] * scale.items[((row0 + r) / fp8.block) * kb + (cols.lo + c) / fp8.block]);
-        values[r * k + c] = v;
-        amax = @max(amax, @abs(v));
-    };
-    const global: f32 = if (amax > 0) amax / (6 * 448) else 1;
     const nibbles = try L.gpa.alloc(u8, n * k);
     defer L.gpa.free(nibbles);
     const block_scales = try L.gpa.alloc(u8, n * (k / 16));
     defer L.gpa.free(block_scales);
-    var err2: f64 = 0;
-    var ref2: f64 = 0;
-    for (0..n) |r| for (0..k / 16) |b| {
-        const at_v = r * k + b * 16;
-        const sb = fp4Block(values[at_v..][0..16], global, nibbles[at_v..][0..16], &lut);
-        block_scales[r * (k / 16) + b] = sb;
-        const s = lut[sb] * global;
-        for (values[at_v..][0..16], nibbles[at_v..][0..16]) |v, c| {
-            const d: f64 = v - e2m1Value(c) * s;
-            err2 += d * d;
-            ref2 += @as(f64, v) * v;
-        }
-    };
     const packed_codes = try L.gpa.alloc(u8, n * k / 2);
     defer L.gpa.free(packed_codes);
-    for (0..n * k / 2) |i| packed_codes[i] = nibbles[2 * i] | (nibbles[2 * i + 1] << 4);
     const words = try L.gpa.alloc(u32, words_len);
     defer L.gpa.free(words);
-    cuda.nvfp4.packWords(words, packed_codes, n, k);
+    // The rows split over fp4_workers threads: dequantize (and each worker's amax), then, with the global scale,
+    // quantize and pack nibbles; then the lane's word tiles.
+    var jobs: [fp4_workers]Fp4Job = undefined;
+    const per = (n + fp4_workers - 1) / fp4_workers;
+    for (&jobs, 0..) |*j, i| j.* = .{ .codes = codes, .scale = scale.items, .lut = &lut, .values = values, .nibbles = nibbles, .block_scales = block_scales, .packed_codes = packed_codes, .words = words, .n = n, .k = k, .kb = kb, .row0 = row0, .col0 = cols.lo, .r0 = @min(n, i * per), .r1 = @min(n, (i + 1) * per) };
+    fp4Run(&jobs, Fp4Job.dequant);
+    var amax: f32 = 0;
+    for (jobs) |j| amax = @max(amax, j.amax);
+    const global: f32 = if (amax > 0) amax / (6 * 448) else 1;
+    for (&jobs) |*j| j.global = global;
+    fp4Run(&jobs, Fp4Job.quantize);
+    var err2: f64 = 0;
+    var ref2: f64 = 0;
+    for (jobs) |j| {
+        err2 += j.err2;
+        ref2 += j.ref2;
+    }
+    const tiles = npad / 64;
+    const tper = (tiles + fp4_workers - 1) / fp4_workers;
+    for (&jobs, 0..) |*j, i| {
+        j.t0 = @min(tiles, i * tper);
+        j.t1 = @min(tiles, (i + 1) * tper);
+    }
+    fp4Run(&jobs, Fp4Job.packTiles);
     const packed_scales = try L.gpa.alloc(u8, scales_len);
     defer L.gpa.free(packed_scales);
     cuda.nvfp4.packScales(packed_scales, block_scales, n, k);
