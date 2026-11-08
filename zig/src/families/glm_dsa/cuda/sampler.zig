@@ -446,6 +446,56 @@ pub fn drawCandidates(allocator: std.mem.Allocator, candidates: []const Candidat
     return winner.id;
 }
 
+/// Whether drawCandidates' top-p nucleus over `candidates` (the merged global top K) at a temperature T < 1 is the one
+/// the full vocabulary gives, for every total the merged T = 1 logsumexp `log_z` allows. Every other token scores at
+/// most the smallest candidate logit c (each rank sent its own top K), so at T < 1 its mass relative to the top
+/// candidate is at most exp((c - top)(1/T - 1)) times its T = 1 mass, which log_z minus the candidates' mass bounds.
+/// The same nucleus size at both ends of that range means the same tokens, so the same Gumbel keys and winner.
+pub fn temperedNucleusFits(allocator: std.mem.Allocator, candidates: []const Candidate, log_z: f32, rule: Sampling) !bool {
+    if (!(rule.temperature > 0 and rule.temperature < 1) or rule.top_k != 0 or !(rule.top_p > 0 and rule.top_p < 1)) return false;
+    if (candidates.len == 0 or !std.math.isFinite(log_z)) return false;
+    const ordered = try allocator.dupe(Candidate, candidates);
+    defer allocator.free(ordered);
+    std.mem.sort(Candidate, ordered, {}, less);
+    const scaled = try allocator.alloc(f64, ordered.len);
+    defer allocator.free(scaled);
+    const temperature = @max(rule.temperature, 1e-6);
+    for (ordered, scaled) |c, *v| v.* = @as(f64, c.value) / temperature;
+    const norm = numpyPairwiseSumExp(scaled);
+    if (!(norm > 0) or !std.math.isFinite(norm)) return false;
+    const top: f64 = ordered[0].value;
+    const smallest: f64 = ordered[ordered.len - 1].value;
+    var mass: f64 = 0;
+    for (ordered) |c| mass += @exp(@as(f64, c.value) - top);
+    // The GPU logsumexp is f32: keep 1e-5 of the total as slack so rounding never hides tail mass.
+    const total = @exp(@as(f64, log_z) - top);
+    const tail = @max(total - mass, 0) + 1e-5 * total;
+    const wide = norm + tail * @exp((smallest - top) * (1 / temperature - 1));
+    const keep = topPCount(scaled, norm, rule.top_p);
+    var cumulative: f64 = 0;
+    for (scaled, 0..) |v, i| {
+        cumulative += @exp(v - scaled[0]) / wide;
+        if (cumulative >= rule.top_p) return i + 1 == keep;
+    }
+    return false;
+}
+
+test "tempered nucleus fits a peaked row and falls back on a flat or truncated one" {
+    const a = std.testing.allocator;
+    const peaked = [_]Candidate{ .{ .value = 30, .id = 1 }, .{ .value = 29, .id = 2 }, .{ .value = 20, .id = 3 }, .{ .value = 10, .id = 4 } };
+    // log_z at T = 1 a hair above the candidates' own mass: the tail is negligible.
+    var m: f64 = 0;
+    for (peaked) |c| m += @exp(@as(f64, c.value) - 30);
+    const rule: Sampling = .{ .temperature = 0.6, .top_p = 0.95 };
+    try std.testing.expect(try temperedNucleusFits(a, &peaked, @floatCast(30 + @log(m * 1.0001)), rule));
+    // A tail as heavy as the candidates themselves, close to the top: the boundary can move, so fall back.
+    const flat = [_]Candidate{ .{ .value = 30, .id = 1 }, .{ .value = 29.9, .id = 2 }, .{ .value = 29.8, .id = 3 } };
+    try std.testing.expect(!try temperedNucleusFits(a, &flat, 30 + @log(@as(f32, 400)), rule));
+    // T = 1 and T > 1 keep the exact paths they had.
+    try std.testing.expect(!try temperedNucleusFits(a, &peaked, 31, .{ .temperature = 1, .top_p = 0.95 }));
+    try std.testing.expect(!try temperedNucleusFits(a, &peaked, 31, .{ .temperature = 1.2, .top_p = 0.95 }));
+}
+
 fn topPCount(scaled: []const f64, norm: f64, top_p: f64) usize {
     var count: usize = 0;
     var cumulative: f64 = 0;

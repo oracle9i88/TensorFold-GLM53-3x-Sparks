@@ -266,6 +266,9 @@ pub const Engine = struct {
     profile_checked: bool = false,
     profile_enabled: bool = false,
     profile_warned_graphs: bool = false,
+    /// Profiled verify windows and their rows since the last report (TF_GLM53_PROFILE=1 logs every 32 windows).
+    prof_windows: u64 = 0,
+    prof_rows: u64 = 0,
 
     /// Set on both ranks when the begin frame installs a request's sampling rule.
     pub fn setSamplingRule(e: *Engine, rule: sampler.Sampling) !void {
@@ -509,7 +512,9 @@ pub const Engine = struct {
             @memset(e.fallback_log_z[0..rows], std.math.nan(f32));
             for (0..rows) |r| {
                 var fits = false;
-                if (e.rule.top_k == 0 and e.rule.temperature == 1 and e.rule.top_p > 0 and e.rule.top_p < 1) {
+                // T <= 1 nuclei are checked on the candidates first; only a row whose nucleus may reach past them
+                // (or T > 1) downloads the full-vocabulary logits.
+                if (e.rule.top_k == 0 and e.rule.temperature > 0 and e.rule.temperature <= 1 and e.rule.top_p > 0 and e.rule.top_p < 1) {
                     const info = try e.nucleusInfo(r);
                     e.fallback_log_z[r] = info.log_z;
                     fits = info.fits;
@@ -560,7 +565,8 @@ pub const Engine = struct {
             };
         }
         const log_z = sampler.mergeLse(rank_lse[0..e.world]);
-        return .{ .fits = try nucleusFitsCandidates(e.gpa, merged, log_z, e.rule), .log_z = log_z };
+        const fits = if (e.rule.temperature == 1) try nucleusFitsCandidates(e.gpa, merged, log_z, e.rule) else try sampler.temperedNucleusFits(e.gpa, merged, log_z, e.rule);
+        return .{ .fits = fits, .log_z = log_z };
     }
 
     fn fetchFullLogitsRow(e: *Engine, stream: cuda.Stream, row: usize) !void {
@@ -961,6 +967,14 @@ pub const Engine = struct {
         if (profiling) {
             try f.stream.synchronize();
             try e.prof.?.collect();
+            e.prof_windows += 1;
+            e.prof_rows += rows;
+            if (e.prof_windows == 32) {
+                if (e.f.rank == 0) e.prof.?.report(e.prof_windows, e.prof_rows, e.pos);
+                e.prof.?.reset();
+                e.prof_windows = 0;
+                e.prof_rows = 0;
+            }
         }
         if (e.mem.on and e.last_outcome == .captured) {
             const what = try std.fmt.allocPrint(e.gpa, "capture rows {d} bucket {d}", .{ rows, key.chunk_bucket });
@@ -1138,9 +1152,12 @@ pub const Engine = struct {
                         const full_logits = if (e.fallback_vocab == 0) &.{} else e.fallback_logits_host[row * e.fallback_vocab ..][0..e.fallback_vocab];
                         return drawNucleusWithFallback(e.gpa, merged, full_logits, force_full, log_z, e.seed, position, e.rule);
                     }
+                    // readHead downloaded the full row only when the candidates could not settle the nucleus
+                    // (sampler.temperedNucleusFits); otherwise the candidates draw the same token.
                     if (e.usesFallbackRows()) {
+                        if (row >= e.fallback_rows.len) return error.FallbackRowsTooSmall;
                         const full_logits = if (e.fallback_vocab == 0) &.{} else e.fallback_logits_host[row * e.fallback_vocab ..][0..e.fallback_vocab];
-                        if (full_logits.len > 0) return drawFullNucleusFromLogits(e.gpa, full_logits, 0, e.seed, position, e.rule);
+                        if (e.fallback_rows[row] and full_logits.len > 0) return drawFullNucleusFromLogits(e.gpa, full_logits, 0, e.seed, position, e.rule);
                     }
                     return e.drawCandidates(merged, position);
                 }

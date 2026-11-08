@@ -765,6 +765,19 @@ pub const Profile = struct {
         }
     }
 
+    /// One log line per stage that ran: its milliseconds per verify window over `windows` windows of `rows` rows in
+    /// all, behind position `position`. Sub-stages (attn_pre.*) also count inside their parent stage.
+    pub fn report(p: *const Profile, windows: u64, rows: u64, position: usize) void {
+        if (windows == 0) return;
+        const w: f64 = @floatFromInt(windows);
+        std.log.info("glm53 profile: {d} windows, {d:.2} rows each, position {d}", .{ windows, @as(f64, @floatFromInt(rows)) / w, position });
+        for (std.enums.values(Stage)) |stage| {
+            const i = @intFromEnum(stage);
+            if (p.counts[i] == 0) continue;
+            std.log.info("glm53 profile: {s:<34} {d:>8.3} ms/window", .{ name(stage), p.totals_ms[i] / w });
+        }
+    }
+
     pub fn reset(p: *Profile) void {
         p.totals_ms = @splat(0);
         p.counts = @splat(0);
