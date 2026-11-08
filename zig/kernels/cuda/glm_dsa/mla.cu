@@ -192,7 +192,8 @@ extern "C" __global__ void tf_glm53_absorb_decode_v2(const __nv_bfloat16* q, con
 // before starting the ordered per-output FMA chain.  The absolute kv_b row for a
 // head is not always 128-row aligned (448 rows/head), so three scale entries are
 // needed for odd global heads to preserve kvb()'s exact block selection.
-__device__ __forceinline__ void tf_glm53_absorb_decode_v3_task(const __nv_bfloat16* q, const uint8_t* kvb_codes,
+template <bool absorb_rows_together>
+__device__ __forceinline__ void tf_glm53_absorb_decode_v3_task_t(const __nv_bfloat16* q, const uint8_t* kvb_codes,
                                             const float* kvb_scales, __nv_bfloat16* qa,
                                             int rows, int local_heads, int head0) {
   const int h = TF_VBID.y, t = threadIdx.x;
@@ -224,8 +225,28 @@ __device__ __forceinline__ void tf_glm53_absorb_decode_v3_task(const __nv_bfloat
   if (t < 3) scales[t] = kvb_scales[(first_row / 128 + t) * 4 + column0 / 128];
   __syncthreads();
 
+  // Threads 0-63 take rows 0, 2, 4, 6 and 64-127 rows 1, 3, 5, 7. Each weight is decoded once and fed to all of a
+  // thread's rows (TF_GLM53_ABSORB_ROWS=1), instead of one full d loop per row; every output still accumulates
+  // d = 0..ND-1 in order from 0, with the same operands, so the results are bit-identical either way.
   const int r0 = t / 64;
   const int c = column0 + (t % 64);
+  if constexpr (absorb_rows_together) {
+    const int mine = (rows - r0 + 1) / 2;
+    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+    #pragma unroll 4
+    for (int d = 0; d < ND; ++d) {
+      const int scale_index = (first_row + d) / 128 - first_row / 128;
+      const __nv_fp8_e4m3 code = *reinterpret_cast<const __nv_fp8_e4m3*>(weight_slab + d * 64 + (t % 64));
+      const float w = tf_mla::bf(rb((float)code * scales[scale_index]));
+      #pragma unroll
+      for (int j = 0; j < 4; ++j)
+        if (j < mine) acc[j] = __fmaf_rn(tf_mla::bf(q_slab[(r0 + 2 * j) * ND + d]), w, acc[j]);
+    }
+    #pragma unroll
+    for (int j = 0; j < 4; ++j)
+      if (j < mine) qa[((int64_t)(r0 + 2 * j) * local_heads + h) * LD + c] = rb(acc[j]);
+    return;
+  }
   for (int rr = r0; rr < rows; rr += 2) {
     float acc = 0.f;
     #pragma unroll 1
@@ -239,11 +260,25 @@ __device__ __forceinline__ void tf_glm53_absorb_decode_v3_task(const __nv_bfloat
   }
 }
 
+__device__ __forceinline__ void tf_glm53_absorb_decode_v3_task(const __nv_bfloat16* q, const uint8_t* kvb_codes,
+                                            const float* kvb_scales, __nv_bfloat16* qa,
+                                            int rows, int local_heads, int head0) {
+  tf_glm53_absorb_decode_v3_task_t<false>(q, kvb_codes, kvb_scales, qa, rows, local_heads, head0);
+}
+
 extern "C" __global__ void tf_glm53_absorb_decode_v3(const __nv_bfloat16* q, const uint8_t* kvb_codes,
                                             const float* kvb_scales, __nv_bfloat16* qa,
                                             int rows, int local_heads, int head0) {
   TF_VBLOCK_ENTER();
   tf_glm53_absorb_decode_v3_task(q, kvb_codes, kvb_scales, qa, rows, local_heads, head0);
+}
+
+// TF_GLM53_ABSORB_ROWS=1: the same kernel, each decoded weight fed to all of a thread's rows (bit-identical).
+extern "C" __global__ void tf_glm53_absorb_decode_v3r(const __nv_bfloat16* q, const uint8_t* kvb_codes,
+                                            const float* kvb_scales, __nv_bfloat16* qa,
+                                            int rows, int local_heads, int head0) {
+  TF_VBLOCK_ENTER();
+  tf_glm53_absorb_decode_v3_task_t<true>(q, kvb_codes, kvb_scales, qa, rows, local_heads, head0);
 }
 
 // DCP decode reads rank-local slots directly. Gather-on-prefill reads global token positions and

@@ -539,6 +539,13 @@ pub const Mla = struct {
     attend_verify_fn: ?cuda.Function = null,
 
 
+    /// TF_GLM53_ABSORB_ROWS=1: decode absorb v3 decodes each kv_b weight once for all of a thread's rows
+    /// (tf_glm53_absorb_decode_v3r) instead of one d loop a row. Same FMA order per output: bit-identical.
+    pub fn absorbRowsSwitch() bool {
+        const v = getenv("TF_GLM53_ABSORB_ROWS") orelse return false;
+        return std.mem.eql(u8, std.mem.span(v), "1");
+    }
+
     pub fn load(module: cuda.Module) !Mla {
         const selected = if (getenv("TF_GLM53_ATTEND")) |raw| blk: {
             const value = std.mem.span(raw);
@@ -561,7 +568,7 @@ pub const Mla = struct {
         const expand_prompt_big_fn = try module.function("tf_glm53_expand_v_prompt_mma_big");
         try absorb_prompt_big_fn.allowDynamicShared(prompt_mla_big_smem);
         try expand_prompt_big_fn.allowDynamicShared(prompt_mla_big_smem);
-        return .{ .prep_fn = try module.function("tf_glm53_kv_write"), .qpe_fn = try module.function("tf_glm53_qpe_pack"), .absorb_fn = try module.function("tf_glm53_absorb"), .absorb_decode_fn = try module.function("tf_glm53_absorb_decode"), .absorb_decode_v2_fn = try module.function("tf_glm53_absorb_decode_v2"), .absorb_decode_v3_fn = try module.function("tf_glm53_absorb_decode_v3"), .attend_fn = try module.function("tf_glm53_attend"), .attend_mma_fn = attend_mma_fn, .attend_split_merge_fn = try module.function("tf_glm53_attend_split_merge"), .attend_kernel = selected, .merge_fn = try module.function("tf_glm53_mla_merge"), .expand_fn = try module.function("tf_glm53_expand_v"), .expand_decode_fn = try module.function("tf_glm53_expand_v_decode"), .expand_decode_v2_fn = try module.function("tf_glm53_expand_v_decode_v2"), .absorb_prompt_fn = absorb_prompt_fn, .expand_prompt_fn = expand_prompt_fn, .smla_p_fn = smla_p_fn, .smla_fp8_fn = smla_fp8_fn, .absorb_prompt_big_fn = absorb_prompt_big_fn, .expand_prompt_big_fn = expand_prompt_big_fn };
+        return .{ .prep_fn = try module.function("tf_glm53_kv_write"), .qpe_fn = try module.function("tf_glm53_qpe_pack"), .absorb_fn = try module.function("tf_glm53_absorb"), .absorb_decode_fn = try module.function("tf_glm53_absorb_decode"), .absorb_decode_v2_fn = try module.function("tf_glm53_absorb_decode_v2"), .absorb_decode_v3_fn = try module.function(if (absorbRowsSwitch()) "tf_glm53_absorb_decode_v3r" else "tf_glm53_absorb_decode_v3"), .attend_fn = try module.function("tf_glm53_attend"), .attend_mma_fn = attend_mma_fn, .attend_split_merge_fn = try module.function("tf_glm53_attend_split_merge"), .attend_kernel = selected, .merge_fn = try module.function("tf_glm53_mla_merge"), .expand_fn = try module.function("tf_glm53_expand_v"), .expand_decode_fn = try module.function("tf_glm53_expand_v_decode"), .expand_decode_v2_fn = try module.function("tf_glm53_expand_v_decode_v2"), .absorb_prompt_fn = absorb_prompt_fn, .expand_prompt_fn = expand_prompt_fn, .smla_p_fn = smla_p_fn, .smla_fp8_fn = smla_fp8_fn, .absorb_prompt_big_fn = absorb_prompt_big_fn, .expand_prompt_big_fn = expand_prompt_big_fn };
 
     }
 

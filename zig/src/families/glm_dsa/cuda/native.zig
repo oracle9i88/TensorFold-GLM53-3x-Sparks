@@ -1109,6 +1109,7 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
         }
         std.log.info("TF_GLM53_HEAD_FP8=1: the decode head reads lm_head as block-FP8 (64x64 tile scales, quantized at load; lossy); the bf16 rows stay for the drafter's Q4 head", .{});
     }
+    if (absorbRowsWanted()) std.log.info("TF_GLM53_ABSORB_ROWS=1: decode absorb v3 feeds each decoded kv_b weight to all of a thread's rows (bit-identical)", .{});
     if (glm.dflash_load.split3Switch()) {
         if (p.world != 3) {
             std.log.err("TF_GLM53_DRAFT_SPLIT3=1 splits the drafter's MLP over three ranks; this run has {d} (two ranks always split it)", .{p.world});
@@ -1790,6 +1791,12 @@ fn hashCommPrioSwitch(hash: *std.crypto.hash.sha2.Sha256, comm_prio: bool) void 
 }
 
 /// Off hashes nothing, so the default digest equals the one before SMLA-FP8 existed.
+/// TF_GLM53_ABSORB_ROWS=1 (read again here for the log and the settings digest; mla.zig picks the kernel).
+fn absorbRowsWanted() bool {
+    const v = std.c.getenv("TF_GLM53_ABSORB_ROWS") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "1");
+}
+
 fn hashSmlaFp8Switch(hash: *std.crypto.hash.sha2.Sha256, smla_fp8: bool) void {
     if (smla_fp8) hash.update("TF_GLM53_SMLA_FP8=1");
 }
@@ -1933,6 +1940,7 @@ fn settingsDigest(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, o: Option
     // the head's bytes per step change with its format, so draft timings recorded with the bf16 head do not carry over
     if (weights.headFp8()) hash.update("TF_GLM53_HEAD_FP8=1");
     if (glm.dflash_load.split3Switch()) hash.update("TF_GLM53_DRAFT_SPLIT3=1");
+    if (absorbRowsWanted()) hash.update("TF_GLM53_ABSORB_ROWS=1");
     try hashPrefixCacheSwitch(&hash, prefixCacheSwitch(), try expertRows());
     hashPromptExperts(&hash, prompt_experts);
     if (prompt_mla != .off) {
