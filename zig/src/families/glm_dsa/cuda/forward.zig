@@ -802,20 +802,31 @@ pub const Profile = struct {
         p.by_rows_windows[r] += 1;
     }
 
-    /// One line per verify-row count seen this request: each top-level stage's ms per window of that many rows.
+    /// A new request: the per-row buckets start over (Engine.prefill calls it).
+    pub fn resetBuckets(p: *Profile) void {
+        p.by_rows_ms = std.mem.zeroes(@TypeOf(p.by_rows_ms));
+        p.by_rows_windows = @splat(0);
+        p.bucket_position = 0;
+    }
+
+    /// One line per verify-row count seen this request: each top-level stage's ms per window of that many rows, then
+    /// (when TF_GLM53_PROFILE_DECODE_SUB timed them) a second line of the attn_pre sub-stages.
     pub fn reportByRows(p: *const Profile) void {
         for (p.by_rows_windows, 0..) |windows, r| {
             if (windows == 0) continue;
             const w: f64 = @floatFromInt(windows);
-            var line: [1024]u8 = undefined;
-            var at: usize = 0;
-            for (std.enums.values(Stage)) |stage| {
-                const i = @intFromEnum(stage);
-                if (isSubStage(stage) or p.by_rows_ms[r][i] == 0) continue;
-                const piece = std.fmt.bufPrint(line[at..], " {s}={d:.2}", .{ name(stage), p.by_rows_ms[r][i] / w }) catch break;
-                at += piece.len;
+            for ([_]bool{ false, true }) |sub| {
+                var line: [1536]u8 = undefined;
+                var at: usize = 0;
+                for (std.enums.values(Stage)) |stage| {
+                    const i = @intFromEnum(stage);
+                    if (isSubStage(stage) != sub or p.by_rows_ms[r][i] == 0) continue;
+                    const piece = std.fmt.bufPrint(line[at..], " {s}={d:.2}", .{ name(stage), p.by_rows_ms[r][i] / w }) catch break;
+                    at += piece.len;
+                }
+                if (at == 0) continue;
+                std.log.info("glm53 profile rows {d:>2}{s}: {d:>5} windows:{s}", .{ r, if (sub) " sub" else "", windows, line[0..at] });
             }
-            std.log.info("glm53 profile rows {d:>2}: {d:>5} windows:{s}", .{ r, windows, line[0..at] });
         }
     }
 

@@ -642,6 +642,7 @@ pub const Engine = struct {
         f.taps = try e.promptTaps(start, start + ids.len);
         f.ablate = if (e.ablate_on) e.abl else null;
         f.sink = .{ .ctx = e, .sink_fn = collect };
+        if (e.prof) |*p| p.resetBuckets(); // a new request: decode's per-row buckets start over
         // TF_GLM53_PROFILE_PREFILL=1 (native sets f.prof_prefill): time this prefill's stages on their own, then
         // drop any partial decode window counts the shared profile held, so neither report mixes the two.
         if (e.f.prof_prefill) {
