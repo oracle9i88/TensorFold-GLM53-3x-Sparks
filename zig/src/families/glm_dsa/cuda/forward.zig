@@ -666,6 +666,13 @@ pub const Profile = struct {
     sequence: u64 = 0,
     totals_ms: [stage_count]f64 = @splat(0),
     counts: [stage_count]u64 = @splat(0),
+    /// Per verify-row count (bucketWindow): each stage's milliseconds and the windows, since the request began.
+    by_rows_ms: [max_bucket_rows + 1][stage_count]f64 = std.mem.zeroes([max_bucket_rows + 1][stage_count]f64),
+    by_rows_windows: [max_bucket_rows + 1]u64 = @splat(0),
+    bucketed_ms: [stage_count]f64 = @splat(0),
+    bucket_position: usize = 0,
+
+    pub const max_bucket_rows = 16;
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, max_layers: usize) !Profile {
         const pairs = try std.math.mul(usize, max_layers, stage_count + profile_extra_pairs);
@@ -779,8 +786,42 @@ pub const Profile = struct {
         }
     }
 
+    /// After collect() at a window's end: what the window added to each stage goes to the bucket of its row count
+    /// (rows past max_bucket_rows share the last). A lower position than the last window's starts a new request.
+    pub fn bucketWindow(p: *Profile, rows: usize, position: usize) void {
+        if (position < p.bucket_position) {
+            p.by_rows_ms = std.mem.zeroes(@TypeOf(p.by_rows_ms));
+            p.by_rows_windows = @splat(0);
+        }
+        p.bucket_position = position;
+        const r = @min(rows, max_bucket_rows);
+        for (0..stage_count) |i| {
+            p.by_rows_ms[r][i] += p.totals_ms[i] - p.bucketed_ms[i];
+            p.bucketed_ms[i] = p.totals_ms[i];
+        }
+        p.by_rows_windows[r] += 1;
+    }
+
+    /// One line per verify-row count seen this request: each top-level stage's ms per window of that many rows.
+    pub fn reportByRows(p: *const Profile) void {
+        for (p.by_rows_windows, 0..) |windows, r| {
+            if (windows == 0) continue;
+            const w: f64 = @floatFromInt(windows);
+            var line: [1024]u8 = undefined;
+            var at: usize = 0;
+            for (std.enums.values(Stage)) |stage| {
+                const i = @intFromEnum(stage);
+                if (isSubStage(stage) or p.by_rows_ms[r][i] == 0) continue;
+                const piece = std.fmt.bufPrint(line[at..], " {s}={d:.2}", .{ name(stage), p.by_rows_ms[r][i] / w }) catch break;
+                at += piece.len;
+            }
+            std.log.info("glm53 profile rows {d:>2}: {d:>5} windows:{s}", .{ r, windows, line[0..at] });
+        }
+    }
+
     pub fn reset(p: *Profile) void {
         p.totals_ms = @splat(0);
+        p.bucketed_ms = @splat(0);
         p.counts = @splat(0);
         @memset(p.open, false);
         @memset(p.started, 0);

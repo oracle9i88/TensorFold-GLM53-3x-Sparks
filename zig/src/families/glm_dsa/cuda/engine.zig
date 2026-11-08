@@ -967,10 +967,14 @@ pub const Engine = struct {
         if (profiling) {
             try f.stream.synchronize();
             try e.prof.?.collect();
+            e.prof.?.bucketWindow(rows, e.pos);
             e.prof_windows += 1;
             e.prof_rows += rows;
             if (e.prof_windows == 32) {
-                if (e.f.rank == 0) e.prof.?.report(e.prof_windows, e.prof_rows, e.pos);
+                if (e.f.rank == 0) {
+                    e.prof.?.report(e.prof_windows, e.prof_rows, e.pos);
+                    e.prof.?.reportByRows();
+                }
                 e.prof.?.reset();
                 e.prof_windows = 0;
                 e.prof_rows = 0;
