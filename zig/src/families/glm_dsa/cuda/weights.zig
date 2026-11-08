@@ -592,6 +592,15 @@ pub fn backboneFp4() bool {
     return std.mem.eql(u8, std.mem.span(v), "1");
 }
 
+/// TF_GLM53_BACKBONE_FP4_QA=1 (with TF_GLM53_BACKBONE_FP4=1): NVFP4 also for the query side's replicated projections,
+/// q_a and the indexer's wq_b, which every rank reads whole each step (about 21 MB of FP8 a layer). kv_a and the
+/// indexer wk stay FP8: their outputs are cached as keys. The grouped q_a | kv_a | wk launch (TF_GLM53_PRE_FUSE and
+/// TF_GLM53_PREP_FUSE) takes FP8 only, so native refuses this switch unless both are 0.
+pub fn backboneFp4Qa() bool {
+    const v = std.c.getenv("TF_GLM53_BACKBONE_FP4_QA") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "1");
+}
+
 fn fp4Eligible(prefix: []const u8) bool {
     const has = struct {
         fn f(s: []const u8, part: []const u8) bool {
@@ -599,6 +608,7 @@ fn fp4Eligible(prefix: []const u8) bool {
         }
     }.f;
     if (has(prefix, "self_attn.o_proj.") or has(prefix, "self_attn.q_b_proj.") or has(prefix, "mlp.shared_experts.")) return true;
+    if (backboneFp4Qa() and (has(prefix, "self_attn.q_a_proj.") or has(prefix, "self_attn.indexer.wq_b."))) return true;
     // The first dense layers' MLP (the MoE layers' routed experts are EXL3 and never reach linear()).
     return has(prefix, ".mlp.") and !has(prefix, "experts") and (has(prefix, "gate_proj.") or has(prefix, "up_proj.") or has(prefix, "down_proj."));
 }

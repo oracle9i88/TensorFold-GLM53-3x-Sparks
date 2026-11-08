@@ -1001,6 +1001,14 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
     if ((pre_fuse != .off or prep_fuse != .off) and shard_qkv_a) return error.PreFuseWithShardQkvA;
     if (pre_fuse != .off and forward.megakernelSwitch()) return error.PreFuseWithMegakernel;
     std.log.info("TF_GLM53_PRE_FUSE={s} TF_GLM53_PREP_FUSE={s}: grouped q_a | kv_a | indexer wk projections (bit-identical; 0 = off)", .{ preFuseDigestValue(pre_fuse), prepFuseDigestValue(prep_fuse) });
+    if (weights.backboneFp4Qa() and (pre_fuse != .off or prep_fuse != .off)) {
+        std.log.err("TF_GLM53_BACKBONE_FP4_QA=1 needs TF_GLM53_PRE_FUSE=0 and TF_GLM53_PREP_FUSE=0: the grouped q_a | kv_a | wk launch takes FP8 weights only", .{});
+        return error.PreFuseNeedsFp8QA;
+    }
+    if (weights.backboneFp4Qa() and !weights.backboneFp4()) {
+        std.log.err("TF_GLM53_BACKBONE_FP4_QA=1 extends TF_GLM53_BACKBONE_FP4=1: set both", .{});
+        return error.BackboneFp4QaNeedsFp4;
+    }
     const prefetch_enabled = forward.prefetchSwitch();
     const tbo_enabled = forward.tboSwitch();
     const profile_prefill = forward.profilePrefillSwitch();
