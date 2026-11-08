@@ -193,7 +193,9 @@ pub const Group = struct {
             b.setTimeoutMs(timeout_ms);
         }
         const sizes = [_]usize{ 16, 4096, 24 << 10, 64 << 10, 192 << 10, 1 << 20 };
-        const most = @min(sizes[sizes.len - 1], a.max_bytes);
+        // usize spelled out: @min with a comptime-known operand narrows its result type (to u21 here), and 6 * most
+        // then wrapped to 0 in ReleaseFast (the first build allocated a 0-byte `got` and a 1 MiB `buf`)
+        const most: usize = @min(sizes[sizes.len - 1], a.max_bytes);
         var buf = try memory.DeviceBuffer.alloc(d, 7 * most);
         defer buf.free();
         const mine = try gpa.alloc(u8, most);
@@ -203,6 +205,7 @@ pub const Group = struct {
         // Every rank runs every round whatever it saw, so the three keep issuing the same NCCL calls; a poisoned pair
         // returns at once from later launches and its neighbours stop waiting at their own deadline.
         var ok = true;
+        var checked: usize = 0;
         for (0..3) |round| for (sizes) |bytes| {
             if (bytes > most) continue;
             for (mine[0..bytes], 0..) |*x, i| x.* = @intCast((i * 7 + g.rank * 13 + round * 5 + bytes) % 251);
@@ -210,13 +213,26 @@ pub const Group = struct {
             try roce.Gather.triGather(a, b, s.handle, buf.ptr, buf.ptr + most, bytes);
             try g.lib.check(g.lib.api.ncclAllGather(buf.ptr, buf.ptr + 4 * most, bytes, .u8, g.comm, s.handle), "ncclAllGather(RoCE triangle probe)");
             try s.synchronize();
-            if (!ok or a.failedQuietly() or b.failedQuietly()) {
+            if (!ok) continue;
+            if (a.failedQuietly() or b.failedQuietly()) {
+                std.log.warn("RoCE triangle probe rank {d}: a pair timed out or its proxy failed at {d} bytes (round {d})", .{ g.rank, bytes, round });
                 ok = false;
                 continue;
             }
             try buf.download(most, got[0 .. 6 * most]);
-            if (!std.mem.eql(u8, got[0 .. 3 * bytes], got[3 * most ..][0 .. 3 * bytes])) ok = false;
+            const roce_rows = got[0 .. 3 * bytes];
+            const nccl_rows = got[3 * most ..][0 .. 3 * bytes];
+            var first_diff: ?usize = null;
+            for (roce_rows, nccl_rows, 0..) |x, y, i| if (x != y) {
+                first_diff = i;
+                break;
+            };
+            if (first_diff) |i| {
+                std.log.warn("RoCE triangle probe rank {d}: {d} bytes differ from NCCL at byte {d} (roce {d}, nccl {d})", .{ g.rank, bytes, i, roce_rows[i], nccl_rows[i] });
+                ok = false;
+            } else checked += 1;
         };
+        if (ok) std.log.info("RoCE triangle probe rank {d}: {d} gathers (16 B to {d} KiB, both slots) match NCCL byte for byte", .{ g.rank, checked, most >> 10 });
         return ok;
     }
 

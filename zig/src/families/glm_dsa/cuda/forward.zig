@@ -794,7 +794,7 @@ pub const Profile = struct {
             p.by_rows_windows = @splat(0);
         }
         p.bucket_position = position;
-        const r = @min(rows, max_bucket_rows);
+        const r: usize = @min(rows, max_bucket_rows);
         for (0..stage_count) |i| {
             p.by_rows_ms[r][i] += p.totals_ms[i] - p.bucketed_ms[i];
             p.bucketed_ms[i] = p.totals_ms[i];
