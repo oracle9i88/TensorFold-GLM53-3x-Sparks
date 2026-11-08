@@ -601,6 +601,99 @@ pub fn backboneFp4Qa() bool {
     return std.mem.eql(u8, std.mem.span(v), "1");
 }
 
+/// TF_GLM53_HEAD_FP8=1: the decode head reads this rank's lm_head rows as block-FP8 (`linearBf16AsFp8`), about half
+/// the ~635 MB of bf16 rows it reads every step. Lossy: the checkpoint keeps lm_head in bf16. The bf16 rows stay
+/// resident as well, because the drafter derives its Q4 head from them at load (drafts.packTargetHead), so the switch
+/// costs about 0.3 GiB a rank instead of saving it.
+pub fn headFp8() bool {
+    const v = std.c.getenv("TF_GLM53_HEAD_FP8") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "1");
+}
+
+/// OCP e4m3 (float8_e4m3fn) of an fp32 value: nearest even, saturating at 448, NaN to 0x7F (a copy of
+/// core/exlr8_codec.zig e4m3FromF32, kept local to this loader).
+fn headE4m3(x: f32) u8 {
+    const bits: u32 = @bitCast(x);
+    const sign: u8 = @intCast((bits >> 24) & 0x80);
+    const a = bits & 0x7FFFFFFF;
+    if (a > 0x7F800000) return sign | 0x7F;
+    if (a >= 0x43E00000) return sign | 0x7E;
+    if (a >= 0x3C800000) {
+        const r = (a + 0x7FFFF + ((a >> 20) & 1)) & 0xFFF00000;
+        return sign | @as(u8, @intCast(((r >> 23) - 120) << 3 | ((r >> 20) & 7)));
+    }
+    const e = a >> 23;
+    if (e == 0 or e < 141 - 40) return sign;
+    const s: u6 = @intCast(141 - e);
+    const m: u64 = (a & 0x7FFFFF) | 0x800000;
+    const half = @as(u64, 1) << (s - 1);
+    const rem = m & ((@as(u64, 1) << s) - 1);
+    var n = m >> s;
+    if (rem > half or (rem == half and n & 1 == 1)) n += 1;
+    return sign | @as(u8, @intCast(n));
+}
+
+test "headE4m3 matches the e4m3 values it encodes" {
+    for (0..0x7F) |c| {
+        const v = fp8.fp8bWeight(@intCast(c), 1);
+        try std.testing.expectEqual(@as(u8, @intCast(c)), headE4m3(v));
+        try std.testing.expectEqual(@as(u8, @intCast(c | 0x80)), headE4m3(-v));
+    }
+    try std.testing.expectEqual(@as(u8, 0x7E), headE4m3(1000));
+    try std.testing.expectEqual(@as(u8, 0x38), headE4m3(1.0));
+}
+
+/// TF_GLM53_HEAD_FP8=1: one bf16 projection (lm_head) as the lane's block-FP8 (`.fp8b`). Every 64 x 64 tile, the
+/// granularity at which the fp8b kernels read a scale (fp8.packBlockScales expands a checkpoint's 128 x 128 blocks to
+/// it), gets scale = max|w| / 448 and codes e4m3(w / scale). Rows are read 64 at a time, so the bf16 table is never
+/// on the host whole; the e4m3 codes are (n x k bytes, about 318 MB for lm_head).
+fn linearBf16AsFp8(L: *Loader, name: []u8, part: Part, cols: Span, n: usize, k: usize, full_cols: usize) !qmmf.Weight {
+    const g = qmmf.group;
+    if (n == 0 or n % g != 0 or k % g != 0 or cols.lo % g != 0 or cols.len() != k or cols.hi > full_cols) {
+        L.gpa.free(name);
+        return error.BadLinearShape;
+    }
+    const ntile = fp8.padded(n) / g;
+    const ktile = k / g;
+    const packed_len = fp8.padded(n) * k;
+    const t_out = (try L.reserve(name, .e4m3, packed_len, ntile * ktile * 4, n, k)) orelse return fp8.blockWeight(0, 0, n, k);
+    var nb: [320]u8 = undefined;
+    const raw = try std.fmt.bufPrint(&nb, "{s}weight", .{part.prefix});
+    const whole_cols = cols.lo == 0 and cols.hi == full_cols;
+    const codes = try L.gpa.alloc(u8, n * k);
+    defer L.gpa.free(codes);
+    const scales = try L.gpa.alloc(f32, ntile * ktile);
+    defer L.gpa.free(scales);
+    @memset(scales, 1.0);
+    const vals = try L.gpa.alloc(f32, g * k);
+    defer L.gpa.free(vals);
+    for (0..n / g) |rt| {
+        const lo = part.rows.lo + rt * g;
+        const t = try rowsOf(L, raw, .{ .lo = lo, .hi = lo + g }, whole_cols);
+        const r0 = if (whole_cols) 0 else lo;
+        for (0..g) |r| for (0..k) |c| {
+            vals[r * k + c] = try f32Value(t, (r0 + r) * full_cols + cols.lo + c);
+        };
+        for (0..ktile) |ct| {
+            var amax: f32 = 0;
+            for (0..g) |r| for (0..g) |c| {
+                amax = @max(amax, @abs(vals[r * k + ct * g + c]));
+            };
+            const s: f32 = if (amax > 0 and std.math.isFinite(amax)) amax / 448.0 else 1.0;
+            scales[rt * ktile + ct] = s;
+            for (0..g) |r| for (0..g) |c| {
+                codes[(rt * g + r) * k + ct * g + c] = headE4m3(vals[r * k + ct * g + c] / s);
+            };
+        }
+    }
+    const packed_codes = try L.gpa.alloc(u8, packed_len);
+    defer L.gpa.free(packed_codes);
+    fp8.packCodes(packed_codes, codes, n, k);
+    try L.write(t_out.data, 0, packed_codes);
+    try L.write(t_out.scales.?, 0, std.mem.sliceAsBytes(scales));
+    return fp8.blockWeight(t_out.data.ptr, t_out.scales.?.ptr, n, k);
+}
+
 fn fp4Eligible(prefix: []const u8) bool {
     const has = struct {
         fn f(s: []const u8, part: []const u8) bool {
@@ -1216,11 +1309,16 @@ fn walk(L: *Loader, c: *const Config, rank: usize, world: usize, select: Select,
         const embed = try plain(L, "embed_tokens.weight", vocab, null, .bf16);
         const norm = try plain(L, "norm.weight", null, null, .bf16);
         const head = try linear(L, &.{.{ .prefix = "lm_head.", .rows = vocab }}, .{ .lo = 0, .hi = c.hidden });
+        const head8: ?qmmf.Weight = if (headFp8())
+            try linearBf16AsFp8(L, try L.label("{s}weight.fp8", .{"lm_head."}), .{ .prefix = "lm_head.", .rows = vocab }, .{ .lo = 0, .hi = c.hidden }, vocab.len(), c.hidden, (try L.header("lm_head.weight")).dim(1))
+        else
+            null;
         if (model) |m| {
             m.vocab = vocab;
             m.embed = embed;
             m.norm = norm;
             m.head = head;
+            m.head8 = head8;
         }
         L.ck.release();
         if (L.budget) |trace_budget| TraceHook.step(trace_budget.trace, "weight upload globals", "other", 0);
@@ -1355,6 +1453,8 @@ pub const ModelWeights = struct {
     norm: u64 = 0,
     /// This rank's lm_head rows on the `.bf16` lane, read with fp32 output (TF_GLM_F32_LOGITS=1).
     head: ?qmmf.Weight = null,
+    /// TF_GLM53_HEAD_FP8=1: the same rows as block-FP8 (`.fp8b`, 64 x 64 tile scales); the decode head reads these.
+    head8: ?qmmf.Weight = null,
     /// One arena per weight class (zero-length when the class is empty); tensors are spans of them.
     arenas: [class_count]cuda.DeviceBuffer = @splat(.{ .d = undefined, .ptr = 0, .len = 0 }),
     cursors: [class_count]u64 = @splat(0),

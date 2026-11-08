@@ -3042,7 +3042,8 @@ pub const Forward = struct {
         const ws = &f.st.ws;
         const k = f.k;
         const s = f.stream;
-        const head = f.w.head orelse return error.NoHead;
+        // TF_GLM53_HEAD_FP8=1 loads a block-FP8 copy; the bf16 rows remain for the drafter's derived head.
+        const head = f.w.head8 orelse (f.w.head orelse return error.NoHead);
         const vocab = f.w.vocab.len();
         if (ws.head_rows == 0 or ws.head_rows > state.max_head_rows) return error.BadHeadRows;
         var at: usize = 0;

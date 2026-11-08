@@ -1102,6 +1102,13 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
         }
         std.log.info("TF_GLM53_MOE_BALANCE={s}: routed experts load with a span table ({s})", .{ @tagName(moe_balance), if (moe_balance == .expert) "six-block share rotated by expert and layer" else "one span a layer, per-expert kernels" });
     }
+    if (weights.headFp8()) {
+        if (forward.megakernelSwitch()) {
+            std.log.err("TF_GLM53_HEAD_FP8=1: the megakernel reads the bf16 head; set TF_GLM53_MK=0", .{});
+            return error.HeadFp8WithMegakernel;
+        }
+        std.log.info("TF_GLM53_HEAD_FP8=1: the decode head reads lm_head as block-FP8 (64x64 tile scales, quantized at load; lossy); the bf16 rows stay for the drafter's Q4 head", .{});
+    }
     const selection: weights.Select = .{ .manifest = if (mf) |*m| m else null, .shard_qkv_a = shard_qkv_a, .moe_balance = moe_balance };
     var plan = try weights.planRank(gpa, io, dir, cfg, p.rank, p.world, selection);
     defer plan.deinit(gpa);
@@ -1916,6 +1923,8 @@ fn settingsDigest(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, o: Option
         hash.update("TF_GLM53_MOE_BALANCE=");
         hash.update(@tagName(moe_balance));
     }
+    // the head's bytes per step change with its format, so draft timings recorded with the bf16 head do not carry over
+    if (weights.headFp8()) hash.update("TF_GLM53_HEAD_FP8=1");
     try hashPrefixCacheSwitch(&hash, prefixCacheSwitch(), try expertRows());
     hashPromptExperts(&hash, prompt_experts);
     if (prompt_mla != .off) {
