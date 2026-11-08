@@ -501,6 +501,7 @@ fn linear(L: *Loader, parts: []const Part, cols: Span) !qmmf.Weight {
     const k = cols.len();
     if (k == 0 or n == 0 or k % fp8.group != 0 or cols.lo % fp8.group != 0 or cols.hi > full_cols) return error.BadLinearShape;
     const name = try L.label("{s}weight", .{parts[0].prefix});
+    if (is_f8 and backboneFp4() and fp4Eligible(parts[0].prefix)) return linearFp8AsFp4(L, name, parts, cols, n, k, full_cols);
     if (is_f8) return linearFp8(L, name, parts, cols, n, k, full_cols);
     return linearBf16(L, name, parts, cols, n, k, full_cols);
 }
@@ -581,6 +582,166 @@ fn linearBf16(L: *Loader, name: []u8, parts: []const Part, cols: Span, n: usize,
         }
     }
     return .{ .mode = .bf16, .codes = t_out.data.ptr, .scales = 0, .n = @intCast(n), .k = @intCast(k), .npad = @intCast(npad) };
+}
+
+/// TF_GLM53_BACKBONE_FP4=1: the block-FP8 projections only the lane matmul reads (o_proj, q_b_proj, the shared and
+/// dense MLPs) load as NVFP4 instead (e2m1 codes, an e4m3 scale every 16 inputs, one fp32 global), so every window
+/// reads about half their bytes. kv_b (read by the MLA kernels) and the grouped q_a/kv_a/indexer projections stay FP8.
+pub fn backboneFp4() bool {
+    const v = std.c.getenv("TF_GLM53_BACKBONE_FP4") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "1");
+}
+
+fn fp4Eligible(prefix: []const u8) bool {
+    const has = struct {
+        fn f(s: []const u8, part: []const u8) bool {
+            return std.mem.indexOf(u8, s, part) != null;
+        }
+    }.f;
+    if (has(prefix, "self_attn.o_proj.") or has(prefix, "self_attn.q_b_proj.") or has(prefix, "mlp.shared_experts.")) return true;
+    // The first dense layers' MLP (the MoE layers' routed experts are EXL3 and never reach linear()).
+    return has(prefix, ".mlp.") and !has(prefix, "experts") and (has(prefix, "gate_proj.") or has(prefix, "up_proj.") or has(prefix, "down_proj."));
+}
+
+/// Every e4m3 code's value (fp8bWeight at scale 1: exact, since bf16 holds any e4m3 value).
+fn e4m3Table() [256]f32 {
+    var t: [256]f32 = undefined;
+    for (&t, 0..) |*v, i| v.* = fp8.fp8bWeight(@intCast(i), 1);
+    return t;
+}
+
+/// The e4m3 byte (positive, finite) at or below `x`, and the one above it: a block tries both.
+fn e4m3Around(x: f32, lut: *const [256]f32) [2]u8 {
+    var lo: u8 = 0;
+    var hi: u8 = 0x7e; // 448, the largest finite e4m3
+    if (x >= lut[hi]) return .{ hi, hi };
+    while (hi - lo > 1) {
+        const mid = lo + (hi - lo) / 2;
+        if (lut[mid] <= x) lo = mid else hi = mid;
+    }
+    return .{ lo, hi };
+}
+
+/// The e2m1 nibble nearest `x` (sign in bit 3), saturating at 6.
+fn e2m1Code(x: f32) u8 {
+    const a = @abs(x);
+    const mag: u8 = if (a <= 0.25) 0 else if (a <= 0.75) 1 else if (a <= 1.25) 2 else if (a <= 1.75) 3 else if (a <= 2.5) 4 else if (a <= 3.5) 5 else if (a <= 5) 6 else 7;
+    return if (x < 0 and mag != 0) mag | 8 else mag;
+}
+
+const e2m1_values = [8]f32{ 0, 0.5, 1, 1.5, 2, 3, 4, 6 };
+
+fn e2m1Value(code: u8) f32 {
+    const v = e2m1_values[code & 7];
+    return if (code & 8 != 0) -v else v;
+}
+
+/// Quantize one block of 16 values at the global scale `g`: the e4m3 scale (of the two around the ideal one) whose
+/// codes give the smaller squared error, written into `codes` (nibbles, unpacked) and returned.
+fn fp4Block(values: []const f32, g: f32, codes: []u8, lut: *const [256]f32) u8 {
+    var amax: f32 = 0;
+    for (values) |v| amax = @max(amax, @abs(v));
+    if (amax == 0) {
+        @memset(codes, 0);
+        return 0;
+    }
+    const around = e4m3Around(amax / (6 * g), lut);
+    var best: u8 = around[0];
+    var best_err = std.math.inf(f32);
+    for (around) |b| {
+        const s = lut[b] * g;
+        if (s == 0) continue;
+        var err: f32 = 0;
+        for (values) |v| {
+            const d = v - e2m1Value(e2m1Code(v / s)) * s;
+            err += d * d;
+        }
+        if (err < best_err) {
+            best_err = err;
+            best = b;
+        }
+    }
+    const s = lut[best] * g;
+    for (values, codes) |v, *c| c.* = if (s == 0) 0 else e2m1Code(v / s);
+    return best;
+}
+
+/// linearFp8's tensor, dequantized exactly as the FP8 lane reads it (fp8bWeight, 128x128 scale_inv blocks) and
+/// re-quantized to NVFP4 for the lane matmul (cuda.nvfp4 layout).
+fn linearFp8AsFp4(L: *Loader, name: []u8, parts: []const Part, cols: Span, n: usize, k: usize, full_cols: usize) !qmmf.Weight {
+    var nb: [320]u8 = undefined;
+    if (k % 64 != 0) return error.BadLinearShape;
+    const npad = cuda.nvfp4.padded(n);
+    const words_len = npad / 64 * (k / 64) * 512;
+    const scales_len = npad * (k / 16);
+    const t_out = (try L.reserve(name, .e4m3, words_len * 4, scales_len, n, k)) orelse return cuda.nvfp4.weight(0, 0, 1, n, k);
+    const whole_cols = cols.lo == 0 and cols.hi == full_cols;
+    const kb = (full_cols + fp8.block - 1) / fp8.block;
+    const codes = try L.gpa.alloc(u8, n * k);
+    defer L.gpa.free(codes);
+    var scale: std.ArrayList(f32) = .empty;
+    defer scale.deinit(L.gpa);
+    var at: usize = 0;
+    for (parts) |p| {
+        const raw = try std.fmt.bufPrint(&nb, "{s}weight", .{p.prefix});
+        const t = try rowsOf(L, raw, p.rows, whole_cols);
+        const r0 = if (whole_cols) 0 else p.rows.lo;
+        for (0..p.rows.len()) |r| {
+            @memcpy(codes[at..][0..k], t.bytes[(r0 + r) * full_cols + cols.lo ..][0..k]);
+            at += k;
+        }
+        const full_rows = (try L.header(raw)).dim(0);
+        const s = try L.tensor(try std.fmt.bufPrint(&nb, "{s}weight_scale_inv", .{p.prefix}));
+        if (s.dtype != .f32 or s.numel() != ((full_rows + fp8.block - 1) / fp8.block) * kb) return error.BadScaleShape;
+        const b0 = if (parts.len == 1) 0 else p.rows.lo / fp8.block;
+        const b1 = if (parts.len == 1) s.numel() / kb else (p.rows.hi + fp8.block - 1) / fp8.block;
+        for (b0 * kb..b1 * kb) |i| try scale.append(L.gpa, std.mem.bytesToValue(f32, s.bytes[i * 4 ..][0..4]));
+    }
+    // One part keeps the source tensor's block rows (row0 its first row); stacked parts are 128-row aligned and their
+    // block rows were appended in order, as fp8.packBlockScales reads them.
+    const row0 = if (parts.len == 1) parts[0].rows.lo else 0;
+    const lut = e4m3Table();
+    const values = try L.gpa.alloc(f32, n * k);
+    defer L.gpa.free(values);
+    var amax: f32 = 0;
+    for (0..n) |r| for (0..k) |c| {
+        // fp8bWeight without its per-call pow: the code's value times scale_inv, rounded to bf16.
+        const v = fp8.roundBf16(lut[codes[r * k + c]] * scale.items[((row0 + r) / fp8.block) * kb + (cols.lo + c) / fp8.block]);
+        values[r * k + c] = v;
+        amax = @max(amax, @abs(v));
+    };
+    const global: f32 = if (amax > 0) amax / (6 * 448) else 1;
+    const nibbles = try L.gpa.alloc(u8, n * k);
+    defer L.gpa.free(nibbles);
+    const block_scales = try L.gpa.alloc(u8, n * (k / 16));
+    defer L.gpa.free(block_scales);
+    var err2: f64 = 0;
+    var ref2: f64 = 0;
+    for (0..n) |r| for (0..k / 16) |b| {
+        const at_v = r * k + b * 16;
+        const sb = fp4Block(values[at_v..][0..16], global, nibbles[at_v..][0..16], &lut);
+        block_scales[r * (k / 16) + b] = sb;
+        const s = lut[sb] * global;
+        for (values[at_v..][0..16], nibbles[at_v..][0..16]) |v, c| {
+            const d: f64 = v - e2m1Value(c) * s;
+            err2 += d * d;
+            ref2 += @as(f64, v) * v;
+        }
+    };
+    const packed_codes = try L.gpa.alloc(u8, n * k / 2);
+    defer L.gpa.free(packed_codes);
+    for (0..n * k / 2) |i| packed_codes[i] = nibbles[2 * i] | (nibbles[2 * i + 1] << 4);
+    const words = try L.gpa.alloc(u32, words_len);
+    defer L.gpa.free(words);
+    cuda.nvfp4.packWords(words, packed_codes, n, k);
+    const packed_scales = try L.gpa.alloc(u8, scales_len);
+    defer L.gpa.free(packed_scales);
+    cuda.nvfp4.packScales(packed_scales, block_scales, n, k);
+    try L.write(t_out.data, 0, std.mem.sliceAsBytes(words));
+    try L.write(t_out.scales.?, 0, packed_scales);
+    if (std.mem.indexOf(u8, parts[0].prefix, "layers.3.") != null)
+        std.log.info("glm53 backbone fp4: {s} {d}x{d} relative rms error {d:.4}", .{ parts[0].prefix, n, k, if (ref2 > 0) @sqrt(err2 / ref2) else 0 });
+    return cuda.nvfp4.weight(t_out.data.ptr, t_out.scales.?.ptr, global, n, k);
 }
 
 /// kv_b as stored: row-major E4M3 rows of this rank's heads and their scale_inv rows (128-row aligned).

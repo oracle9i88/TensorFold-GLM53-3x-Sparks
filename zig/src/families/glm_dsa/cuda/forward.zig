@@ -1679,7 +1679,7 @@ pub const Forward = struct {
     fn projectPreGroup(f: *const Forward, mode: Mode, s: cuda.Stream, xn: u64, rows: usize, a: weights.Attention) !void {
         var buf: [3]cuda.qmmf.GroupOut = undefined;
         const prefetch = mode == .decode and f.pre_fuse == .prefetch;
-        try f.k.lane.matmulGroup(s, xn, hidden, rows, f.preGroupOuts(a, &buf), .{ .split = mode == .prefill and f.prep_fuse == .split, .prefetch = if (prefetch) a.q_b.codes else 0, .prefetch_bytes = if (prefetch) @as(usize, a.q_b.npad) * a.q_b.k else 0 });
+        try f.k.lane.matmulGroup(s, xn, hidden, rows, f.preGroupOuts(a, &buf), .{ .split = mode == .prefill and f.prep_fuse == .split, .prefetch = if (prefetch) a.q_b.codes else 0, .prefetch_bytes = if (prefetch) @as(usize, a.q_b.npad) * a.q_b.k / @as(usize, if (a.q_b.mode == .fp4) 2 else 1) else 0 });
     }
     fn validatePreGroup(f: *const Forward) !void {
         if (f.shardQkvAEnabled()) return error.PreFuseWithShardQkvA;

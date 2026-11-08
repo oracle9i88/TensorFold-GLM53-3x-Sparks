@@ -51,7 +51,7 @@ pub fn swigluPlain(f: cuda.Function, stream: cuda.Stream, gu: u64, out: u64, row
 /// Execute a rank's dense MLP split: [gate | up] -> plain SwiGLU -> fp32 down partial.
 pub fn block(k: Kernels, stream: cuda.Stream, w: Weights, s: Scratch, x: u64, rows: usize, width: usize, out: u64) !void {
     if (width % 128 != 0 or width == 0) return error.BadMlpWidth;
-    if (w.gate_up.mode != .fp8b or w.down.mode != .fp8b or w.gate_up.k != hidden or w.down.n != hidden or w.down.k != width or w.gate_up.n != width * 2) return error.BadMlpWeights;
+    if ((w.gate_up.mode != .fp8b and w.gate_up.mode != .fp4) or (w.down.mode != .fp8b and w.down.mode != .fp4) or w.gate_up.k != hidden or w.down.n != hidden or w.down.k != width or w.gate_up.n != width * 2) return error.BadMlpWeights;
     try k.project(stream, x, hidden, rows, w.gate_up, s.gate_up, .bf16, s.mm_part);
     try swigluPlain(k.swiglu_plain, stream, s.gate_up, s.activation, rows, width);
     try k.project(stream, s.activation, width, rows, w.down, out, .f32, s.mm_part);
