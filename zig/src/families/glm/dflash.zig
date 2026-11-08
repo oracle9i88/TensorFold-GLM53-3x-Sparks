@@ -138,6 +138,7 @@ pub const Kernels = struct {
     attn_part: cuda.Function,
     attn_merge: cuda.Function,
     sum2: cuda.Function,
+    sum3: cuda.Function,
     top16_part: cuda.Function,
     top16_merge: cuda.Function,
     gsum: cuda.Function,
@@ -223,7 +224,7 @@ pub const Drafter = struct {
     conf_w: []u16 = &.{}, // DSpark bf16 [6400]
     conf_b: f32 = 0,
     hrows: []u16 = &.{}, // block hidden rows [MAX_M][hidden], host confidence input
-    split: bool, // the MLP split across two ranks (gate and up by rows, down by K)
+    split: bool, // the MLP split across the ranks (two, or three with TF_GLM53_DRAFT_SPLIT3=1): gate and up by rows, down by K
     ff: usize, // the MLP width this rank holds
     rank: usize,
     world: usize,
@@ -260,7 +261,7 @@ pub const Drafter = struct {
     logits: u64 = 0,
     part: u64 = 0, // the linears' K-slice partials
     gs: u64 = 0, // a 4-bit linear's input group sums [MAX_CTX][5 * D / 64]
-    sums: u64 = 0, // the split down's gathered fp32 partials [2][MAX_M][D]
+    sums: u64 = 0, // the split down's gathered fp32 partials [world][MAX_M][D]
     cin: u64 = 0,
     c1: u64 = 0,
     ctx: u64 = 0,

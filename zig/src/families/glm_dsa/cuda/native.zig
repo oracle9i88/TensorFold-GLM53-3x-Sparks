@@ -1109,6 +1109,13 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
         }
         std.log.info("TF_GLM53_HEAD_FP8=1: the decode head reads lm_head as block-FP8 (64x64 tile scales, quantized at load; lossy); the bf16 rows stay for the drafter's Q4 head", .{});
     }
+    if (glm.dflash_load.split3Switch()) {
+        if (p.world != 3) {
+            std.log.err("TF_GLM53_DRAFT_SPLIT3=1 splits the drafter's MLP over three ranks; this run has {d} (two ranks always split it)", .{p.world});
+            return error.DraftSplit3NeedsThreeRanks;
+        }
+        std.log.info("TF_GLM53_DRAFT_SPLIT3=1: the drafter's MLP splits over three ranks (a third of gate/up rows and of down's K each; fp32 partials gathered, summed by df_sum3)", .{});
+    }
     const selection: weights.Select = .{ .manifest = if (mf) |*m| m else null, .shard_qkv_a = shard_qkv_a, .moe_balance = moe_balance };
     var plan = try weights.planRank(gpa, io, dir, cfg, p.rank, p.world, selection);
     defer plan.deinit(gpa);
@@ -1925,6 +1932,7 @@ fn settingsDigest(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, o: Option
     }
     // the head's bytes per step change with its format, so draft timings recorded with the bf16 head do not carry over
     if (weights.headFp8()) hash.update("TF_GLM53_HEAD_FP8=1");
+    if (glm.dflash_load.split3Switch()) hash.update("TF_GLM53_DRAFT_SPLIT3=1");
     try hashPrefixCacheSwitch(&hash, prefixCacheSwitch(), try expertRows());
     hashPromptExperts(&hash, prompt_experts);
     if (prompt_mla != .off) {

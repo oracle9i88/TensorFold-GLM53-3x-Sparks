@@ -292,6 +292,15 @@ extern "C" __global__ void df_sum2(const float* __restrict__ g, __nv_bfloat16* _
     }
 }
 
+// out = bf16(g rank 0 + g rank 1 + g rank 2): three ranks' gathered fp32 partials [3][R][D] (TF_GLM53_DRAFT_SPLIT3).
+extern "C" __global__ void df_sum3(const float* __restrict__ g, __nv_bfloat16* __restrict__ out, int R) {
+    const long long r = blockIdx.x;
+    for (int c = blockIdx.y * 1024 + threadIdx.x; c < (blockIdx.y + 1) * 1024; c += blockDim.x) {
+        const long long i = r * D + c;
+        out[i] = tobf((g[i] + g[(long long)R * D + i]) + g[2LL * R * D + i]);
+    }
+}
+
 // A rank's 16 largest logits a head row as global ids and fp32 values: per-chunk part, then merge; ties keep low id.
 namespace {
 constexpr int CHUNK_COLS = 4096;
@@ -594,6 +603,16 @@ extern "C" __global__ void df_sum2_glm(const float* __restrict__ g, __nv_bfloat1
     for (int c = blockIdx.y * 1024 + threadIdx.x; c < D; c += blockDim.x) {
         const long long i = r * D + c;
         out[i] = tobf(g[i] + g[(long long)R * D + i]);
+    }
+}
+
+// out = bf16(g rank 0 + g rank 1 + g rank 2): three ranks' gathered fp32 partials [3][R][D] (TF_GLM53_DRAFT_SPLIT3).
+extern "C" __global__ void df_sum3_glm(const float* __restrict__ g, __nv_bfloat16* __restrict__ out, int R, int D) {
+    const long long r = blockIdx.x;
+    const int end = min(D, (int)(blockIdx.y + 1) * 1024);
+    for (int c = blockIdx.y * 1024 + threadIdx.x; c < end; c += blockDim.x) {
+        const long long i = r * D + c;
+        out[i] = tobf((g[i] + g[(long long)R * D + i]) + g[2LL * R * D + i]);
     }
 }
 

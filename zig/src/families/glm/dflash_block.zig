@@ -227,7 +227,7 @@ pub fn pass(dr: *Drafter, e: anytype, S: usize, rank0: bool) !void {
             a.add(@as(i32, @intCast(dr.ff)));
             try go(dr.k.swiglu, .{ .x = @intCast(M), .y = @intCast((dr.ff + 1023) / 1024) }, 256, e, &a);
         }
-        if (dr.split) { // each rank's half of down's K as fp32 partials, gathered and summed
+        if (dr.split) { // each rank's share of down's K as fp32 partials, gathered and summed
             const bytes = M * D * 4;
             try linB(dr, e, dr.act, l.down, dr.sums + e.share.rank * bytes, M, true);
             try gather(e, dr.sums, bytes);
@@ -236,7 +236,7 @@ pub fn pass(dr: *Drafter, e: anytype, S: usize, rank0: bool) !void {
             a.add(dr.a);
             a.add(@as(i32, @intCast(M)));
             if (!g.flashKernelAbi()) a.add(@as(i32, @intCast(D)));
-            try go(dr.k.sum2, .{ .x = @intCast(M), .y = @intCast((D + 1023) / 1024) }, 256, e, &a);
+            try go(if (dr.world == 3) dr.k.sum3 else dr.k.sum2, .{ .x = @intCast(M), .y = @intCast((D + 1023) / 1024) }, 256, e, &a);
         } else try linB(dr, e, dr.act, l.down, dr.a, M, false);
         if (g.conv) {
             try conv(dr, e, dr.a, 1, l.m_base + g.conv_kernel * D * 2, dr.x, true, M);

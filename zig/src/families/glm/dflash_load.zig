@@ -414,8 +414,10 @@ fn loadWithHeadChunkedSharedInner(gpa: std.mem.Allocator, io: std.Io, e: anytype
     for (header.entries) |entry| try ents.put(entry.name, .{ .off = entry.off, .n = entry.n });
     var used = std.StringHashMap(void).init(gpa);
     defer used.deinit();
-    const split = world == 2;
-    const ff: usize = if (split) FF / 2 else FF;
+    // Two ranks always split the MLP; three ranks do with TF_GLM53_DRAFT_SPLIT3=1 (each a third of the width).
+    const split = world == 2 or (world == 3 and split3Switch());
+    const ff: usize = if (split) FF / world else FF;
+    if (split and FF % (world * 128) != 0) return error.BadDrafterSplit;
     const small: u64 = (if (geometry.conv) @as(u64, 6) * D64 * 2 else @as(u64, 2) * D64 * 2) + 2 * @as(u64, @intCast(geometry.head_dim)) * 2 + (if (geometry.conv) @as(u64, 2) * @as(u64, @intCast(geometry.conv_kernel)) * 2 * D64 * 2 + @as(u64, @intCast(geometry.conv_group)) * 256 else @as(u64, 0));
     const per: u64 = if (bits == 4) 1 else 4; // quarter-bytes a weight: 4 bits (plus scales and biases below) or bf16
     const lin_elems: u64 = QKV64 * D64 + 2 * KVW64 * D64 + QW64 * D64 + 2 * @as(u64, @intCast(ff)) * D64 + (if (geometry.conv) @as(u64, 2) * @as(u64, @intCast(CONVW)) * D64 else @as(u64, 0)) + @as(u64, @intCast(geometry.taps.len)) * D64 * D64 / @as(u64, @intCast(geometry.layers));
@@ -478,7 +480,7 @@ fn loadWithHeadChunkedSharedInner(gpa: std.mem.Allocator, io: std.Io, e: anytype
         const gate = try layerName(&nb[1], i, "mlp.gate_proj.weight");
         const up = try layerName(&nb[2], i, "mlp.up_proj.weight");
         const down = try layerName(&nb[3], i, "mlp.down_proj.weight");
-        if (split) { // this rank's half of the MLP width: gate and up rows, down columns
+        if (split) { // this rank's share of the MLP width: gate and up rows, down columns
             lw.gu = try l.linear(&.{ gate, up }, &.{ FF, FF }, D, .{ rank * ff, ff, 0, D });
             lw.down = try l.linearB(&.{down}, &.{D}, FF, .{ 0, 0, rank * ff, ff });
         } else {
@@ -562,6 +564,13 @@ const Tail = struct {
 };
 
 /// The drafter's scratch, every field one carved piece of one buffer.
+/// TF_GLM53_DRAFT_SPLIT3=1: with three ranks, split the MLP like two ranks do (gate and up by rows, down by K, the
+/// fp32 partials gathered and summed by df_sum3) instead of every rank reading the whole MLP each pass.
+pub fn split3Switch() bool {
+    const v = std.c.getenv("TF_GLM53_DRAFT_SPLIT3") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "1");
+}
+
 fn carve(dr: *Drafter, d: *const cuda.Driver, head_n: usize) !void {
     const g = dr.geometry;
     const D: u64 = @intCast(g.hidden);
@@ -593,7 +602,7 @@ fn carve(dr: *Drafter, d: *const cuda.Driver, head_n: usize) !void {
         .{ "qkv", M * g.qkvWidth() * 2 },                                                        .{ "q", M * QW * 2 },                         .{ "kb", M * KVW * 2 },           .{ "vb", M * KVW * 2 },
         .{ "att", M * QW * 2 },                                                                  .{ "a", M * D * 2 },                          .{ "gu", M * 2 * FF * 2 },        .{ "act", M * FF * 2 },
         .{ "hn", M * D * 2 },                                                                    .{ "xs", M * (D / 64) * 4 },                  .{ "g", M * RANK * 4 },           .{ "logits", M * head_n * 2 },
-        .{ "part", part },                                                                       .{ "gs", C * g.taps.len * (D / 64) * 4 },     .{ "sums", 2 * M * D * 4 },       .{ "cin", C * TAP_ROW },
+        .{ "part", part },                                                                       .{ "gs", C * g.taps.len * (D / 64) * 4 },     .{ "sums", @as(u64, if (dr.split) dr.world else 2) * M * D * 4 },      .{ "cin", C * TAP_ROW },
         .{ "c1", C * D * 2 },                                                                    .{ "ctx", C * D * 2 },                        .{ "ckv", C * 2 * KVW * 2 },      .{ "taps_step", df.STEP_ROWS * TAP_ROW },
         .{ "taps_prefill", C * TAP_ROW },                                                        .{ "ids", M * 4 },                            .{ "bpos", M * 4 },               .{ "rings", df.MAX_S * 8 },
         .{ "starts", df.MAX_S * 8 },                                                             .{ "froms", df.MAX_S * 8 },                   .{ "cpos", C * 8 },               .{ "crings", C * 8 },

@@ -474,7 +474,7 @@ pub fn weightBytes(g: Geometry, bits: u8, world: usize) !u64 {
     if (world == 0 or world > 3) return error.BadDrafterWorld;
     const d: u64 = @intCast(g.hidden);
     const kv: u64 = @intCast(g.kvWidth());
-    const ff: u64 = @intCast(if (world == 2) g.intermediate / 2 else g.intermediate);
+    const ff: u64 = @intCast(if (world == 2) g.intermediate / 2 else if (world == 3 and glm.dflash_load.split3Switch()) g.intermediate / 3 else g.intermediate);
     const qkv: u64 = @intCast(g.qkvWidth());
     const conv: u64 = @intCast(g.convWidth());
     const qw: u64 = @intCast(g.queryWidth());
@@ -518,7 +518,7 @@ pub fn memoryPlan(g: Geometry, bits: u8, world: usize, streams: usize) !MemoryPl
     if (world == 2 and g.vocab % 2 != 0) return error.BadDrafterWorld;
     if (streams == 0 or streams > 16) return error.BadDrafterStreams;
     const d: u64 = @intCast(g.hidden);
-    const ff: u64 = @intCast(if (world == 2) g.intermediate / 2 else g.intermediate);
+    const ff: u64 = @intCast(if (world == 2) g.intermediate / 2 else if (world == 3 and glm.dflash_load.split3Switch()) g.intermediate / 3 else g.intermediate);
     const qkv: u64 = @intCast(g.qkvWidth());
     const kv: u64 = @intCast(g.kvWidth());
     const qw: u64 = @intCast(g.queryWidth());
@@ -544,7 +544,7 @@ pub fn memoryPlan(g: Geometry, bits: u8, world: usize, streams: usize) !MemoryPl
     const fields = [_]u64{
         m * d * 2,                     m * d * 2,                              m * d * 2,                                      m * conv * 2,         m * qkv * 2,          m * qw * 2,                        m * kv * 2,     m * kv * 2,
         m * qw * 2,                    m * d * 2,                              m * 2 * @as(u64, @intCast(g.intermediate)) * 2, m * @as(u64, @intCast(g.intermediate)) * 2,           m * d * 2,            m * (d / 64) * 4,                  m * rank * 4,   m * head_n * 2,
-        part,                          c * g.target_layers.len * (d / 64) * 4, 2 * m * d * 4,                                  c * g.tapRowBytes(),  c * d * 2,            c * d * 2,                         c * 2 * kv * 2, 32 * g.tapRowBytes(),
+        part,                          c * g.target_layers.len * (d / 64) * 4, (if (world == 3 and glm.dflash_load.split3Switch()) @as(u64, 3) else 2) * m * d * 4,                                 c * g.tapRowBytes(),  c * d * 2,            c * d * 2,                         c * 2 * kv * 2, 32 * g.tapRowBytes(),
         c * g.tapRowBytes(),           m * 4,                                  m * 4,                                          16 * 8,               16 * 8,               16 * 8,                            c * 8,          c * 8,
         world * m * (2 * g.selector_top_k) * 4, m * chunks * g.selector_top_k * 4, m * chunks * g.selector_top_k * 4, m * g.heads * 16 * 4, m * g.heads * 16 * 4, m * g.heads * 16 * g.head_dim * 4,
     };
