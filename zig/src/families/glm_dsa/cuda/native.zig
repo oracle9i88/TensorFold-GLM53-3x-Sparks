@@ -1347,6 +1347,8 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
         }
     }
     if (own.group.hasRoce()) own.engine.download.group = &own.group;
+    own.engine.f.prof_prefill = profile_prefill;
+    if (profile_prefill) std.log.info("TF_GLM53_PROFILE_PREFILL=1: rank 0 logs each prefill's stage times (eager, synchronized: slower)", .{});
     try own.engine.f.validateSetup();
     own.engine.mem.floor = try state.floorFromEnv();
     if (prefix_cache_enabled) {

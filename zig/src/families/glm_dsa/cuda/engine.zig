@@ -642,6 +642,15 @@ pub const Engine = struct {
         f.taps = try e.promptTaps(start, start + ids.len);
         f.ablate = if (e.ablate_on) e.abl else null;
         f.sink = .{ .ctx = e, .sink_fn = collect };
+        // TF_GLM53_PROFILE_PREFILL=1 (native sets f.prof_prefill): time this prefill's stages on their own, then
+        // drop any partial decode window counts the shared profile held, so neither report mixes the two.
+        if (e.f.prof_prefill) {
+            if (e.prof == null) e.prof = try forward.Profile.init(e.gpa, e.f.stream.d, e.f.w.config.layers + 1);
+            e.prof.?.reset();
+            e.prof_windows = 0;
+            e.prof_rows = 0;
+            f.prof = &e.prof.?;
+        }
         var at: usize = 0;
         while (at < ids.len) {
             const c = try forward.chunkRows(positions, f.chunk_rows, at);
@@ -655,6 +664,15 @@ pub const Engine = struct {
         } else {
             e.parkBeforeWrite(start + ids.len);
             try f.pieced(.{ .positions = positions, .tokens = ids });
+        }
+        if (e.f.prof_prefill) {
+            try e.f.stream.synchronize();
+            try e.prof.?.collect();
+            if (e.f.rank == 0) {
+                std.log.info("glm53 prefill profile: {d} rows from position {d} (stage ms for the whole prefill)", .{ ids.len, start });
+                e.prof.?.report(1, ids.len, start);
+            }
+            e.prof.?.reset();
         }
         if (e.park) |*pk| pk.notePrefill(start, start + ids.len);
         try e.history.appendSlice(e.gpa, ids);
