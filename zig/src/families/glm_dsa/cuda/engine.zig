@@ -12,6 +12,8 @@ const state = @import("state.zig");
 const uma = @import("uma.zig");
 const mk_defer = @import("mk_defer");
 pub const side_park = @import("park.zig");
+pub const capture_mod = @import("capture.zig");
+test { _ = capture_mod; }
 test { _ = side_park; }
 
 /// A captured graph's key includes every layout switch baked into its decode launch, along with the window rows and
@@ -202,6 +204,10 @@ pub const Engine = struct {
     abl: ?*const @import("ablate").Ablation = null,
     ablate_on: bool = false,
     drafter: ?Drafter = null,
+    /// TF_GLM53_CAPTURE_DIR (rank 0, attached once serving starts): drafter training rows per request. Null: off.
+    capture: ?*capture_mod.Capture = null,
+    /// Drafter drafts in the next verify window (the adapter sets it; copy proposals count 0), for the capture.
+    capture_held: u32 = 0,
     /// Fine resident prompt reuse grain; zero keeps the normal prefill piece grain.
     reuse_grain: usize = 0,
     agreement: ?Agreement = null,
@@ -679,6 +685,7 @@ pub const Engine = struct {
         try e.history.appendSlice(e.gpa, ids);
         e.pos += ids.len;
         e.frontier = e.pos;
+        e.capturePrompt(start, e.pos);
         try e.promptTapped(start, e.pos);
         var out: [1]u32 = undefined;
         try e.draw(e.head_rows - 1, 1, e.pos - 1, &out);
@@ -847,6 +854,20 @@ pub const Engine = struct {
         e.draft_fill_pending.clearRetainingCapacity();
     }
 
+    /// The capture's prompt rows: the taps this prefill pass wrote (positions from..end at taps_prefill rows 0..,
+    /// the `from` promptTaps chose).
+    fn capturePrompt(e: *Engine, start: usize, end: usize) void {
+        const c = e.capture orelse return;
+        const d = e.drafter orelse return;
+        c.prompt(e.f.stream, d.taps_prefill.out, start, @max(start, end -| d.window), end);
+    }
+
+    /// The adapter's release calls this first, before any rollback: the capture's end block holds the transcript.
+    pub fn captureEnd(e: *Engine) void {
+        const c = e.capture orelse return;
+        c.end(e.history.items[0..@min(e.pos, e.history.items.len)], e.rule.temperature, e.rule.top_p, e.rule.top_k, e.seed);
+    }
+
     pub fn requestEnd(e: *Engine) !void {
         if (e.f.rank == 0 and e.rule.temperature > 0) std.log.info("glm53 sample: full-vocab fallback rows {d}", .{e.fallback_count});
         try e.memPoint("request end");
@@ -871,6 +892,7 @@ pub const Engine = struct {
         try e.history.appendSlice(e.gpa, ids);
         e.pos += ids.len;
         e.frontier = e.pos;
+        e.capturePrompt(start, e.pos);
         try e.promptTapped(start, e.pos);
     }
 
@@ -1012,6 +1034,9 @@ pub const Engine = struct {
         if (e.drafter) |d| try d.verify_fn(d.ctx, rows, e.pos);
         try e.readHead(f.stream, f.st.ws.head_gather, rows, rows * f.head.rowBytes());
         try e.draw(0, rows, e.pos, out);
+        // The window's tap rows (taps_step from e.pos) and final residual rows are still in place after the draw.
+        if (e.capture) |c| if (e.drafter) |d| c.verify(f.stream, d.taps_step.out, f.st.ws.x, e.pos, e.capture_held, e.window[0..rows], out[0..rows]);
+        e.capture_held = 0;
     }
 
     /// Spark parity hook: one verify window run eagerly, then through the graph cache twice (capture, replay); the

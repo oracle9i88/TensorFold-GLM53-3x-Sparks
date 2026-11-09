@@ -553,6 +553,8 @@ const Owned = struct {
     prefix_snap: ?*prefix_snap.Snap(engine_mod.Engine) = null,
     prefix_cache_budget_bytes: u64 = 0,
     prefix_cache_floor_bytes: u64 = 0,
+    /// TF_GLM53_CAPTURE_DIR (rank 0): the engine's capture, freed here.
+    capture: ?*engine_mod.capture_mod.Capture = null,
     alive_model: bool = false,
     alive_host: bool = false,
     alive_ablation: bool = false,
@@ -570,6 +572,12 @@ const Owned = struct {
     alive_w8a8: bool = false,
 
     fn deinit(own: *Owned) void {
+        if (own.capture) |cap| {
+            own.engine.capture = null;
+            cap.deinit();
+            own.gpa.destroy(cap);
+            own.capture = null;
+        }
         if (own.prefix_snap) |snap| { snap.deinit(); own.gpa.destroy(snap); }
         if (own.prefix_device) |device| { device.deinit(); own.gpa.destroy(device); }
         if (own.prefix_pool) |*pool| pool.deinit();
@@ -933,6 +941,11 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
         _ = try prefixCacheBudgetBytes();
         _ = try prefixCacheFloorBytes();
     }
+    // TF_GLM53_CAPTURE_DIR: every request prefills from row 0 (resident reuse off), so each file holds the prompt
+    // taps its drafter saw; the disk prefix cache and fine reuse would skip those rows.
+    const capture_dir = captureDirEnv();
+    if (capture_dir != null and prefix_cache_enabled) return error.CaptureNeedsNoPrefixCache;
+    if (capture_dir != null and reuse_grain != 0) return error.CaptureNeedsNoFineReuse;
 
     const lowrank_decode = moe.decodeSwitch();
     const row_prune = envSwitch("TF_GLM53_ROW_PRUNE");
@@ -1410,7 +1423,8 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
             .ring_adopt_fn = drafts.Host.ringAdopt,
         };
     }
-    const resident = residentEnabled();
+    const resident = residentEnabled() and capture_dir == null;
+    if (capture_dir != null and residentEnabled() and p.rank == 0) std.log.info("TF_GLM53_CAPTURE_DIR: resident reuse off (TF_GLM53_RESIDENT=1 ignored)", .{});
     own.engine.resident = resident;
     own.engine.reuse_grain = reuse_grain;
     if (side_rows != 0) own.engine.park = .{ .rows = side_rows, .adapt_limit = adapt_limit_position, .long_from = long_from };
@@ -1609,8 +1623,26 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
         defer prewarm.deinit(gpa, prompts);
         _ = try prewarm.run(&own.adapter, prompts, {}, cfg.vocab);
     }
+    // Attached last, so load-time windows (graph warm-up, prewarm) never reach a capture file.
+    if (capture_dir) |cdir| {
+        if (!own.alive_host or own.engine.drafter == null) return error.CaptureNeedsDrafter;
+        try std.Io.Dir.cwd().createDirPath(io, cdir);
+        const cap = try gpa.create(engine_mod.capture_mod.Capture);
+        errdefer gpa.destroy(cap);
+        cap.* = try engine_mod.capture_mod.Capture.init(gpa, cdir, own.host.dr.?.geometry.taps, 6144, own.engine.drafter.?.window, o.drafter orelse "");
+        own.capture = cap;
+        own.engine.capture = cap;
+        std.log.info("TF_GLM53_CAPTURE_DIR={s}: rank 0 writes each request's drafter tap rows and final residual rows (drafter training)", .{cdir});
+    }
     const zon = ze.copy_rows > 1;
     return .{ .backend = own.adapter.backend(), .ctx = own, .deinit = close, .stream_bytes = @intCast(admission.state_bytes + (if (drafter_geometry) |g| drafts.ringBytes(g) else 0)), .facts = own.adapter.facts(), .target = &own.engine, .proposer_ctx = if (zon) &own.zfactory else null, .proposer_make = if (zon) zngram.Factory.make else null, .proposer_free = if (zon) zngram.Factory.free else null, .ablate = own.alive_ablation };
+}
+
+/// TF_GLM53_CAPTURE_DIR: where rank 0 writes drafter training rows (unset or empty: off). See capture.zig.
+fn captureDirEnv() ?[]const u8 {
+    const raw = std.c.getenv("TF_GLM53_CAPTURE_DIR") orelse return null;
+    const value = std.mem.span(raw);
+    return if (value.len == 0) null else value;
 }
 
 fn residentEnabled() bool {

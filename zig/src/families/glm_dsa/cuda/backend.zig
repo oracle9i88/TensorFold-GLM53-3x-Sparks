@@ -641,6 +641,7 @@ pub fn Adapter(comptime Engine: type) type {
             const start = b.e.pos;
             try emit(b, .verify, start, ids, @intCast(ids.len));
             var sampled: [follow.max_decode_rows]u32 = undefined;
+            if (comptime @hasField(Engine, "capture_held")) b.e.capture_held = @intCast(w.held);
             try b.e.verify(ids, sampled[0..ids.len]);
             if (b.drafting) b.verified_rows += ids.len;
             if (b.traceFile()) |path| recal.verifyLine(path, b.trace_req, start, ids.len, w.held, if (w.held > 0) 0 else w.tokens.len, t0, recal.nowNs() - t0, ids, sampled[0..ids.len]);
@@ -727,6 +728,8 @@ pub fn Adapter(comptime Engine: type) type {
         fn release(ptr: *anyopaque, s: *Stream) void {
             const b = self(ptr);
             if (b.owner == s) {
+                // TF_GLM53_CAPTURE_DIR: the transcript goes out before any rollback below drops it.
+                if (comptime @hasDecl(Engine, "captureEnd")) b.e.captureEnd();
                 b.gpa.free(b.first_mask);
                 b.first_mask = &.{};
                 if (comptime @hasDecl(Engine, "clearMasks")) b.e.clearMasks();
