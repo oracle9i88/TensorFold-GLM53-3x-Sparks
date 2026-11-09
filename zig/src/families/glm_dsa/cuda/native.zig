@@ -920,13 +920,21 @@ const LoadSteps = struct {
 };
 
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, unused: ?[]const u8, o: Options) !Loaded {
-    return openInner(gpa, io, ctx, dir, unused, o) catch |err| {
+    // TF_GLM53_SLOTS=N: --context is each request slot's window; one cache holds the N slots (each `context + 2`
+    // rows, the sentinel rows inside its slot), so everything below sizes for N * (context + 2) - 2 positions.
+    const slots = slotsEnv() catch |err| {
+        std.log.err("GLM-5.3 native open failed: TF_GLM53_SLOTS must be 1..{d}", .{follow.max_lanes});
+        return err;
+    };
+    var whole = o;
+    if (slots > 1) whole.context = slots * (o.context + 2) - 2;
+    return openInner(gpa, io, ctx, dir, unused, whole, slots) catch |err| {
         std.log.err("GLM-5.3 native open failed: {s}", .{@errorName(err)});
         return err;
     };
 }
 
-fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, _: ?[]const u8, o: Options) !Loaded {
+fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, _: ?[]const u8, o: Options, request_slots: usize) !Loaded {
     try validateOptions(o);
     const reuse_grain = try fineReuseGrain();
     if (reuse_grain != 0 and !residentEnabled()) return error.FineReuseNeedsResident;
@@ -946,6 +954,9 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
     const capture_dir = captureDirEnv();
     if (capture_dir != null and prefix_cache_enabled) return error.CaptureNeedsNoPrefixCache;
     if (capture_dir != null and reuse_grain != 0) return error.CaptureNeedsNoFineReuse;
+    // TF_GLM53_SLOTS: one slot per stream, every prompt from row 0 on its own view (no resident rows to reuse).
+    if (request_slots > 1 and capture_dir != null) return error.CaptureNeedsOneSlot;
+    if (request_slots > 1 and reuse_grain != 0) return error.SlotsNeedNoFineReuse;
 
     const lowrank_decode = moe.decodeSwitch();
     const row_prune = envSwitch("TF_GLM53_ROW_PRUNE");
@@ -1423,8 +1434,9 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
             .ring_adopt_fn = drafts.Host.ringAdopt,
         };
     }
-    const resident = residentEnabled() and capture_dir == null;
+    const resident = residentEnabled() and capture_dir == null and request_slots == 1;
     if (capture_dir != null and residentEnabled() and p.rank == 0) std.log.info("TF_GLM53_CAPTURE_DIR: resident reuse off (TF_GLM53_RESIDENT=1 ignored)", .{});
+    if (request_slots > 1 and residentEnabled() and p.rank == 0) std.log.info("TF_GLM53_SLOTS: resident reuse off (TF_GLM53_RESIDENT=1 ignored)", .{});
     own.engine.resident = resident;
     own.engine.reuse_grain = reuse_grain;
     if (side_rows != 0) own.engine.park = .{ .rows = side_rows, .adapt_limit = adapt_limit_position, .long_from = long_from };
@@ -1444,6 +1456,23 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
         std.log.info("glm53 fine reuse: grain {d}", .{reuse_grain});
     }
     own.adapter.drafting = own.alive_host;
+    // TF_GLM53_SLOTS: request slots on views of the one cache; their windows share forwards (eager). Drafts stay off:
+    // a drafted row costs what another stream's row does, so a shared round spends its rows on the streams.
+    if (request_slots > 1) {
+        const views = try gpa.alloc(state.State, request_slots);
+        errdefer gpa.free(views);
+        for (views, 0..) |*v, i| v.* = try own.st.slotView(i, request_slots);
+        const seqs = try gpa.alloc(engine_mod.Seq, request_slots);
+        for (seqs) |*q| q.* = .{};
+        own.engine.views = views;
+        own.engine.seqs = seqs;
+        own.engine.bound = 0;
+        own.engine.f.st = &own.engine.views[0];
+        own.engine.drafter = null;
+        own.adapter.drafting = false;
+        own.adapter.slots = request_slots;
+        if (p.rank == 0) std.log.info("TF_GLM53_SLOTS={d}: {d} request slots of {d} positions on one cache; drafts off, resident reuse off, shared windows eager", .{ request_slots, request_slots, views[0].capacity });
+    }
     own.adapter.draft_chances = own.alive_host and draftChancesSwitch();
     std.log.info("glm53 draft chances: {s}", .{if (own.adapter.draft_chances) "on" else "off"});
     const lane_chances = own.adapter.draft_chances and laneChancesSwitch();
@@ -1635,7 +1664,15 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
         std.log.info("TF_GLM53_CAPTURE_DIR={s}: rank 0 writes each request's drafter tap rows and final residual rows (drafter training)", .{cdir});
     }
     const zon = ze.copy_rows > 1;
-    return .{ .backend = own.adapter.backend(), .ctx = own, .deinit = close, .stream_bytes = @intCast(admission.state_bytes + (if (drafter_geometry) |g| drafts.ringBytes(g) else 0)), .facts = own.adapter.facts(), .target = &own.engine, .proposer_ctx = if (zon) &own.zfactory else null, .proposer_make = if (zon) zngram.Factory.make else null, .proposer_free = if (zon) zngram.Factory.free else null, .ablate = own.alive_ablation };
+    return .{ .backend = own.adapter.backend(), .ctx = own, .deinit = close, .stream_bytes = @intCast(admission.state_bytes + (if (drafter_geometry) |g| drafts.ringBytes(g) else 0)), .facts = own.adapter.facts(), .target = &own.engine, .proposer_ctx = if (zon) &own.zfactory else null, .proposer_make = if (zon) zngram.Factory.make else null, .proposer_free = if (zon) zngram.Factory.free else null, .ablate = own.alive_ablation, .free_streams = @intCast(request_slots) };
+}
+
+/// TF_GLM53_SLOTS: request slots, each `--context` positions on its own view of one cache (unset: 1, one stream).
+fn slotsEnv() !usize {
+    const raw = std.c.getenv("TF_GLM53_SLOTS") orelse return 1;
+    const n = std.fmt.parseInt(usize, std.mem.span(raw), 10) catch return error.BadSlots;
+    if (n == 0 or n > follow.max_lanes) return error.BadSlots;
+    return n;
 }
 
 /// TF_GLM53_CAPTURE_DIR: where rank 0 writes drafter training rows (unset or empty: off). See capture.zig.

@@ -176,6 +176,19 @@ fn saveMemoryBelowThreshold(memory: SaveMemory) bool {
         memory.available_kib < memoryThresholdGiB("TF_GLM53_PREFIX_CACHE_MIN_AVAIL_GIB", 12) *| kib_per_gib;
 }
 
+/// TF_GLM53_SLOTS: an adapter slot's per-stream fields while another slot is bound (Adapter.bindLane swaps them).
+const Lane = struct {
+    owner: ?*Stream = null,
+    window_start: ?usize = null,
+    window_rows: u32 = 0,
+    held: [7]u32 = undefined,
+    held_n: usize = 0,
+    first_mask: []u32 = &.{},
+    first_tok: ?u32 = null,
+    chances: [7]f64 = undefined,
+    conf_buf: [32]f64 = @splat(0),
+};
+
 pub fn Adapter(comptime Engine: type) type {
     return struct {
         gpa: std.mem.Allocator,
@@ -215,6 +228,13 @@ pub fn Adapter(comptime Engine: type) type {
         sweep: bool = false, // TF_GLM53_DRAFT_SWEEP=1: held drafts verified 0,1,..,7,0,.. in turn (cost measurement; tokens unchanged)
         sweep_count: u64 = 0,
         sweep_k: usize = 0,
+        /// TF_GLM53_SLOTS: request slots (one stream each; 1: the single-stream adapter as before), each slot's
+        /// lane fields while another is bound, the bound slot, and the bound slot's first token kept from its prefill
+        /// (another stream's forward may overwrite the head rows before `first` reads them).
+        slots: usize = 1,
+        lanes: [follow.max_lanes]Lane = @splat(.{}),
+        lane: usize = 0,
+        first_tok: ?u32 = null,
 
         pub fn init(gpa: std.mem.Allocator, e: *Engine) @This() {
             return .{ .gpa = gpa, .e = e };
@@ -234,7 +254,7 @@ pub fn Adapter(comptime Engine: type) type {
 
         pub fn facts(b: *const @This()) lanes.Model {
             if (noDraftEnabled()) return .{ .exact_width = 1, .first_copy_rows = 1, .copy_drafts = false, .copy_match = 0, .verify_widths = true, .mtp = false, .speculate = false, .gpu_tokens = false, .max_streams = 1, .batch_rows = b.batch_cap };
-            if (!b.drafting) return .{ .exact_width = b.copy_rows, .first_copy_rows = b.copy_rows, .copy_drafts = b.copy_rows > 1, .copy_match = @intCast(b.copy_match), .verify_widths = true, .mtp = false, .speculate = false, .gpu_tokens = false, .max_streams = 1, .batch_rows = b.batch_cap, .copy_arbitrate = b.copyd, .copy_costs = if (b.copyd) &gb10_verify_costs else &.{} };
+            if (!b.drafting) return .{ .exact_width = b.copy_rows, .first_copy_rows = b.copy_rows, .copy_drafts = b.copy_rows > 1, .copy_match = @intCast(b.copy_match), .verify_widths = true, .mtp = false, .speculate = false, .gpu_tokens = false, .max_streams = @intCast(b.slots), .hidden_rows = b.slots > 1, .shared_costs = if (b.slots > 1) &gb10_verify_costs else &.{}, .batch_rows = if (b.slots > 1) @min(b.batch_cap, follow.max_decode_rows) else b.batch_cap, .copy_arbitrate = b.copyd, .copy_costs = if (b.copyd) &gb10_verify_costs else &.{} };
             return .{ .exact_width = @max(b.copy_rows, 8), .first_copy_rows = b.copy_rows, .copy_drafts = b.copy_rows > 1, .copy_match = @intCast(b.copy_match), .verify_widths = true, .mtp = true, .speculate = true, .speculate_early = false, .drafts = 7, .draft_streams = true, .gpu_tokens = false, .max_streams = 1, .batch_rows = b.batch_cap, .draft_probabilities = b.draft_chances, .window_costs = if (b.draft_chances) b.costTable() else &.{}, .granted_depth = b.lane_chances and b.draft_chances, .copy_first = b.lane_chances and b.draft_chances, .plain_guard = b.live_costs and b.draft_chances, .lone_cost_tile = if (b.live_costs and b.draft_chances) live_cost_tile else 0, .copy_arbitrate = b.copyd, .copy_costs = if (b.copyd) b.costTable() else &.{} };
         }
 
@@ -365,7 +385,7 @@ pub fn Adapter(comptime Engine: type) type {
             try emitSlot(b, kind, position, ids, count, 0);
         }
         fn emitSlot(b: *@This(), kind: follow.Kind, position: usize, ids: []const u32, count: u32, slot: u32) !void {
-            if (b.send_fn) |send| try send(b.link_ctx.?, .{ .kind = @backingInt(kind), .n = count, .slot = slot, .position = position }, ids);
+            if (b.send_fn) |send| try send(b.link_ctx.?, follow.withLane(.{ .kind = @backingInt(kind), .n = count, .slot = slot, .position = position }, b.lane), ids);
         }
 
         fn armMasks(b: *@This(), bits: []const u32, rows: usize) !void {
@@ -394,8 +414,47 @@ pub fn Adapter(comptime Engine: type) type {
             return aligned;
         }
 
+        /// TF_GLM53_SLOTS: bind slot `i`: its lane fields onto the adapter, its sequence onto the engine.
+        fn bindLane(b: *@This(), i: usize) !void {
+            if (i == b.lane) return;
+            if (i >= b.slots) return error.UnknownSlot;
+            b.lanes[b.lane] = .{ .owner = b.owner, .window_start = b.window_start, .window_rows = b.window_rows, .held = b.held, .held_n = b.held_n, .first_mask = b.first_mask, .first_tok = b.first_tok, .chances = b.chances, .conf_buf = b.conf_buf };
+            const l = b.lanes[i];
+            b.owner = l.owner;
+            b.window_start = l.window_start;
+            b.window_rows = l.window_rows;
+            b.held = l.held;
+            b.held_n = l.held_n;
+            b.first_mask = l.first_mask;
+            b.first_tok = l.first_tok;
+            b.chances = l.chances;
+            b.conf_buf = l.conf_buf;
+            if (comptime @hasDecl(Engine, "bind")) try b.e.bind(i);
+            b.lane = i;
+        }
+
+        fn slotOwner(b: *const @This(), i: usize) ?*Stream {
+            return if (i == b.lane) b.owner else b.lanes[i].owner;
+        }
+
+        /// The slot serving `s`, bound. One slot: nothing to bind (the owner checks below stand as before).
+        fn bindStream(b: *@This(), s: *const Stream) !void {
+            if (b.slots == 1) return;
+            for (0..b.slots) |i| if (b.slotOwner(i) == s) return b.bindLane(i);
+            return error.UnknownStream;
+        }
+
+        /// A free slot for a new stream, bound.
+        fn bindFree(b: *@This()) !void {
+            if (b.slots == 1) return;
+            for (0..b.slots) |i| if (b.slotOwner(i) == null) return b.bindLane(i);
+            return error.SingleStreamOnly;
+        }
+
         fn prefill(ptr: *anyopaque, s: *Stream) anyerror!void {
             const b = self(ptr);
+            try b.bindFree();
+            b.first_tok = null;
             b.gpa.free(b.first_mask);
             b.first_mask = &.{};
             if (comptime @hasDecl(Engine, "clearMasks")) b.e.clearMasks();
@@ -508,7 +567,10 @@ pub fn Adapter(comptime Engine: type) type {
             }
             // A warm pass takes this same exact prefill. It has no chunk gate here, so it cannot step aside mid-pass;
             // it only prefills rows the next turn needs, and lane_host's quiet wait keeps it from starting beside work.
-            if (start < prompt.len) _ = try b.e.prefill(prompt[start..]);
+            if (start < prompt.len) {
+                const t = try b.e.prefill(prompt[start..]);
+                if (b.slots > 1) b.first_tok = t;
+            }
         }
 
         fn lastHeader(b: *@This()) follow.Header {
@@ -517,7 +579,7 @@ pub fn Adapter(comptime Engine: type) type {
 
         fn emitHeader(b: *@This(), h: follow.Header) !void {
             b.last_snap_header = h;
-            if (b.send_fn) |send| try send(b.link_ctx.?, h, &.{});
+            if (b.send_fn) |send| try send(b.link_ctx.?, follow.withLane(h, b.lane), &.{});
         }
 
         fn emitSnapshotLoad(b: *@This(), r: usize, ids: []const u32, key: u64) !void {
@@ -550,7 +612,12 @@ pub fn Adapter(comptime Engine: type) type {
 
         fn first(ptr: *anyopaque, s: *Stream, position: u64) anyerror!u64 {
             const b = self(ptr);
+            try b.bindStream(s);
             if (b.owner != s or position != b.e.pos) return error.PositionMismatch;
+            if (b.first_tok) |t| {
+                b.first_tok = null;
+                return put(b, t);
+            }
             var out: [1]u32 = undefined;
             try b.e.draw(b.e.head_rows - 1, 1, position - 1, &out);
             return put(b, out[0]);
@@ -558,6 +625,7 @@ pub fn Adapter(comptime Engine: type) type {
 
         fn firstMasked(ptr: *anyopaque, s: *Stream, position: u64, mask: []const u32) anyerror!u64 {
             const b = self(ptr);
+            try b.bindStream(s);
             if (b.owner != s or position != b.e.pos) return error.PositionMismatch;
             if (b.first_mask.len == 0) return error.FirstMaskNotArmed;
             defer {
@@ -565,6 +633,10 @@ pub fn Adapter(comptime Engine: type) type {
                 b.first_mask = &.{};
             }
             if (!std.mem.eql(u32, mask, b.first_mask)) return error.FirstMaskChanged;
+            if (b.first_tok) |t| {
+                b.first_tok = null;
+                return put(b, t);
+            }
             var out: [1]u32 = undefined;
             try b.e.draw(b.e.head_rows - 1, 1, position - 1, &out);
             return put(b, out[0]);
@@ -572,6 +644,7 @@ pub fn Adapter(comptime Engine: type) type {
 
         fn queue(ptr: *anyopaque, s: *Stream, feed: be.Feed, position: u64) anyerror!u64 {
             const b = self(ptr);
+            try b.bindStream(s);
             if (b.owner != s or position != b.e.pos + 1) return error.PositionMismatch;
             const id = try token(b, feed);
             var out: [1]u32 = undefined;
@@ -590,6 +663,7 @@ pub fn Adapter(comptime Engine: type) type {
 
         fn heldFn(ptr: *anyopaque, s: *Stream, out: []u32) anyerror!void {
             const b = self(ptr);
+            try b.bindStream(s);
             if (b.owner != s) return error.UnknownStream;
             if (out.len > b.held_n) return error.NoHeldDrafts;
             @memcpy(out, b.held[0..out.len]);
@@ -599,6 +673,7 @@ pub fn Adapter(comptime Engine: type) type {
         /// TF_GLM53_DRAFT_RECAL conf: per-slot logistic on (z, margin, logp, 1), greedy or sampled set by the request temperature.
         fn chancesFn(ptr: *anyopaque, s: *Stream, out: []f64) anyerror!bool {
             const b = self(ptr);
+            try b.bindStream(s);
             if (!b.draft_chances or b.owner != s or b.held_n == 0) return false;
             const n: usize = @min(out.len, b.held_n);
             if (b.sweep) {
@@ -621,11 +696,17 @@ pub fn Adapter(comptime Engine: type) type {
 
         fn verify(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
             const b = self(ptr);
-            const t0: u64 = if (b.trace_path != null) recal.nowNs() else 0;
+            if (windows.len > 1 and out.len >= windows.len) return b.verifyMany(windows, out);
             if (windows.len != 1 or out.len != 1) return error.SingleStreamOnly;
-            const w = windows[0];
+            try b.bindStream(windows[0].stream);
+            return b.verifyOne(windows[0], &out[0]);
+        }
+
+        /// One stream's window in a forward of its own (the single-stream verify).
+        fn verifyOne(b: *@This(), w: be.Window, o: *be.Verified) !void {
+            const t0: u64 = if (b.trace_path != null) recal.nowNs() else 0;
             if (b.owner != w.stream or w.parents != null or w.early) return error.UnsupportedWindow;
-            if (w.rows() > follow.max_decode_rows or w.rows() > b.verify_max or out[0].sampled.len < w.rows()) return error.WindowTooWide;
+            if (w.rows() > follow.max_decode_rows or w.rows() > b.verify_max or o.sampled.len < w.rows()) return error.WindowTooWide;
             if (w.held != 0 and !b.drafting) return error.UnsupportedWindow;
             if (w.held > b.held_n) return error.NoHeldDrafts;
             if (w.positions.len == w.rows() and w.positions[0] != b.e.pos + 1) return error.PositionMismatch;
@@ -649,20 +730,28 @@ pub fn Adapter(comptime Engine: type) type {
             try b.e.keep(ids.len);
             b.window_start = start;
             b.window_rows = @intCast(ids.len);
-            @memcpy(out[0].sampled[0..ids.len], sampled[0..ids.len]);
+            @memcpy(o.sampled[0..ids.len], sampled[0..ids.len]);
             if (w.held > 0) {
-                if (out[0].drafts.len < w.held) return error.WindowTooWide;
-                @memcpy(out[0].drafts[0..w.held], drafts);
+                if (o.drafts.len < w.held) return error.WindowTooWide;
+                @memcpy(o.drafts[0..w.held], drafts);
             } else {
-                out[0].drafts = &.{};
+                o.drafts = &.{};
             }
         }
 
         fn keep(ptr: *anyopaque, windows: []const be.Window, paths: []const []const u32) anyerror!void {
             const b = self(ptr);
-            if (windows.len != 1 or paths.len != 1 or b.owner != windows[0].stream) return error.SingleStreamOnly;
-            if (windows[0].parents != null or (windows[0].held != 0 and !b.drafting)) return error.UnsupportedWindow;
-            const kept = paths[0].len;
+            if (windows.len == 0 or windows.len != paths.len or (windows.len > 1 and b.slots == 1)) return error.SingleStreamOnly;
+            for (windows, paths) |w, path| {
+                try b.bindStream(w.stream);
+                try b.keepOne(w, path);
+            }
+        }
+
+        fn keepOne(b: *@This(), w: be.Window, path: []const u32) !void {
+            if (b.owner != w.stream) return error.SingleStreamOnly;
+            if (w.parents != null or (w.held != 0 and !b.drafting)) return error.UnsupportedWindow;
+            const kept = path.len;
             const start = b.window_start orelse return error.NoVerifiedWindow;
             if (kept > b.window_rows) return error.BadKeep;
             if (kept < b.window_rows) {
@@ -676,6 +765,64 @@ pub fn Adapter(comptime Engine: type) type {
             }
             b.window_start = null;
             b.window_rows = 0;
+        }
+
+        /// TF_GLM53_SLOTS: a round's windows, one per stream. One shared forward when every window can share it
+        /// (no held drafts, no grammar masks, one head mode), else a forward a window in turn.
+        fn verifyMany(b: *@This(), windows: []const be.Window, out: []be.Verified) !void {
+            if (comptime @hasDecl(Engine, "verifyShared")) {
+                if (b.slots == 1 or windows.len > b.slots or windows.len > follow.max_lanes) return error.SingleStreamOnly;
+                var share = true;
+                var head: @TypeOf(b.e.f.head) = .greedy;
+                for (windows, 0..) |w, k| {
+                    try b.bindStream(w.stream);
+                    if (w.held != 0 or w.masks.len != 0 or w.parents != null or w.early) share = false;
+                    if (k == 0) head = b.e.f.head else if (!std.meta.eql(head, b.e.f.head)) share = false;
+                }
+                if (!share) {
+                    for (windows, out[0..windows.len]) |w, *o| {
+                        try b.bindStream(w.stream);
+                        try b.verifyOne(w, o);
+                    }
+                    return;
+                }
+                const P = Engine.SharedPart;
+                var parts: [follow.max_lanes]P = undefined;
+                var ids: [follow.max_lanes][follow.max_decode_rows]u32 = undefined;
+                var sampled: [follow.max_lanes][follow.max_decode_rows]u32 = undefined;
+                var frame: [1 + follow.max_lanes * (2 + follow.max_decode_rows)]u32 = undefined;
+                frame[0] = @intCast(windows.len);
+                var at: usize = 1;
+                var total: usize = 0;
+                for (windows, out[0..windows.len], 0..) |w, o, k| {
+                    try b.bindStream(w.stream);
+                    if (b.owner != w.stream) return error.UnsupportedWindow;
+                    const rows = w.rows();
+                    if (rows > follow.max_decode_rows or rows > b.verify_max or o.sampled.len < rows or total + rows > follow.max_decode_rows) return error.WindowTooWide;
+                    if (w.positions.len == rows and w.positions[0] != b.e.pos + 1) return error.PositionMismatch;
+                    ids[k][0] = w.pending;
+                    @memcpy(ids[k][1..][0..w.tokens.len], w.tokens);
+                    parts[k] = .{ .slot = b.lane, .ids = ids[k][0..rows], .out = sampled[k][0..rows] };
+                    frame[at] = @intCast(b.lane);
+                    frame[at + 1] = @intCast(rows);
+                    @memcpy(frame[at + 2 ..][0..rows], ids[k][0..rows]);
+                    at += 2 + rows;
+                    total += rows;
+                }
+                try emit(b, .verify_shared, 0, frame[0..at], @intCast(at));
+                try b.e.verifyShared(parts[0..windows.len]);
+                for (windows, out[0..windows.len], 0..) |w, *o, k| {
+                    try b.bindStream(w.stream);
+                    const rows = parts[k].ids.len;
+                    const start = b.e.pos;
+                    try emit(b, .keep, start, &.{}, @intCast(rows));
+                    try b.e.keep(rows);
+                    b.window_start = start;
+                    b.window_rows = @intCast(rows);
+                    @memcpy(o.sampled[0..rows], sampled[k][0..rows]);
+                    o.drafts = &.{};
+                }
+            } else return error.SingleStreamOnly;
         }
 
         fn draft(ptr: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
@@ -727,6 +874,7 @@ pub fn Adapter(comptime Engine: type) type {
 
         fn release(ptr: *anyopaque, s: *Stream) void {
             const b = self(ptr);
+            b.bindStream(s) catch return;
             if (b.owner == s) {
                 // TF_GLM53_CAPTURE_DIR: the transcript goes out before any rollback below drops it.
                 if (comptime @hasDecl(Engine, "captureEnd")) b.e.captureEnd();

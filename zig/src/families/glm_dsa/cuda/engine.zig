@@ -191,6 +191,32 @@ pub const SnapOps = struct {
 
 const DraftFill = union(enum) { restart: usize, prompt: struct { start: usize, rows: usize } };
 
+/// TF_GLM53_SLOTS: request slots a shared decode window takes at most.
+pub const max_shared = 8;
+
+/// TF_GLM53_SLOTS: a request slot's sequence while another slot is bound. Engine.bind moves a slot's fields between
+/// its Seq and the Engine, so every single-slot step runs unchanged on the bound slot.
+pub const Seq = struct {
+    tapped: usize = 0,
+    tap_high: usize = 0,
+    pos: usize = 0,
+    frontier: usize = 0,
+    history: std.ArrayList(u32) = .empty,
+    last_reused: usize = 0,
+    append_pending: std.ArrayList(u32) = .empty,
+    draft_fill_pending: std.ArrayList(DraftFill) = .empty,
+    window: [forward.max_decode_rows]u32 = undefined,
+    window_rows: usize = 0,
+    seed: u64 = 0,
+    rule: sampler.Sampling = .{ .temperature = 0 },
+    head: forward.HeadMode = .greedy,
+    fallback_count: u64 = 0,
+    drafter: ?Drafter = null,
+};
+
+/// One slot's window in a shared decode window: its input tokens and a drawn token per row.
+pub const Part = struct { slot: usize, ids: []const u32, out: []u32 };
+
 pub const Engine = struct {
     gpa: std.mem.Allocator,
     io: ?std.Io = null,
@@ -204,6 +230,11 @@ pub const Engine = struct {
     abl: ?*const @import("ablate").Ablation = null,
     ablate_on: bool = false,
     drafter: ?Drafter = null,
+    /// TF_GLM53_SLOTS: each request slot's cache view (f.st points at the bound one), each slot's sequence while it
+    /// is not bound, and the bound slot. Empty without slots: slot 0 is the whole cache, always bound.
+    views: []state.State = &.{},
+    seqs: []Seq = &.{},
+    bound: usize = 0,
     /// TF_GLM53_CAPTURE_DIR (rank 0, attached once serving starts): drafter training rows per request. Null: off.
     capture: ?*capture_mod.Capture = null,
     /// Drafter drafts in the next verify window (the adapter sets it; copy proposals count 0), for the capture.
@@ -275,6 +306,9 @@ pub const Engine = struct {
     /// Profiled verify windows and their rows since the last report (TF_GLM53_PROFILE=1 logs every 32 windows).
     prof_windows: u64 = 0,
     prof_rows: u64 = 0,
+
+    /// TF_GLM53_SLOTS: a slot's window in verifyShared (follow.zig names it through the engine type).
+    pub const SharedPart = Part;
 
     /// Set on both ranks when the begin frame installs a request's sampling rule.
     pub fn setSamplingRule(e: *Engine, rule: sampler.Sampling) !void {
@@ -394,8 +428,118 @@ pub const Engine = struct {
         e.gpa.free(e.mask_host);
         if (e.mask_dev) |*buf| buf.free();
 
+        // TF_GLM53_SLOTS: the other slots' lists (the bound slot's are the Engine's, freed above); views own nothing.
+        for (e.seqs, 0..) |*q, i| if (i != e.bound) {
+            q.history.deinit(e.gpa);
+            q.append_pending.deinit(e.gpa);
+            q.draft_fill_pending.deinit(e.gpa);
+        };
+        e.gpa.free(e.seqs);
+        e.gpa.free(e.views);
+
         e.keys.deinit(e.gpa);
         e.* = undefined;
+    }
+
+    /// TF_GLM53_SLOTS: run every step below on request slot `slot` (its cache view, positions, history, sampling rule
+    /// and drafter); the bound slot's fields go back to its Seq first. Without slots only slot 0 exists.
+    pub fn bind(e: *Engine, slot: usize) !void {
+        if (slot == e.bound) return;
+        if (slot >= e.seqs.len or slot >= e.views.len) return error.UnknownSlot;
+        e.stash(&e.seqs[e.bound]);
+        e.load(&e.seqs[slot]);
+        e.f.st = &e.views[slot];
+        e.bound = slot;
+    }
+
+    fn stash(e: *const Engine, q: *Seq) void {
+        q.* = .{
+            .tapped = e.tapped,
+            .tap_high = e.tap_high,
+            .pos = e.pos,
+            .frontier = e.frontier,
+            .history = e.history,
+            .last_reused = e.last_reused,
+            .append_pending = e.append_pending,
+            .draft_fill_pending = e.draft_fill_pending,
+            .window = e.window,
+            .window_rows = e.window_rows,
+            .seed = e.seed,
+            .rule = e.rule,
+            .head = e.f.head,
+            .fallback_count = e.fallback_count,
+            .drafter = e.drafter,
+        };
+    }
+
+    fn load(e: *Engine, q: *const Seq) void {
+        e.tapped = q.tapped;
+        e.tap_high = q.tap_high;
+        e.pos = q.pos;
+        e.frontier = q.frontier;
+        e.history = q.history;
+        e.last_reused = q.last_reused;
+        e.append_pending = q.append_pending;
+        e.draft_fill_pending = q.draft_fill_pending;
+        e.window = q.window;
+        e.window_rows = q.window_rows;
+        e.seed = q.seed;
+        e.rule = q.rule;
+        e.f.head = q.head;
+        e.fallback_count = q.fallback_count;
+        e.drafter = q.drafter;
+    }
+
+    /// TF_GLM53_SLOTS: one decode window over several slots' windows (rows in part order, each slot's cache work on
+    /// its own view), then each slot draws its rows under its own rule. As `verify`, positions do not move: each
+    /// slot's rows are kept (or rolled back) on that slot afterwards. Eager: the segments' views bake no graph.
+    pub fn verifyShared(e: *Engine, parts: []const Part) !void {
+        if (parts.len == 0 or parts.len > max_shared) return error.BadSharedWindow;
+        var positions: [forward.max_decode_rows]usize = undefined;
+        var ids: [forward.max_decode_rows]u32 = undefined;
+        var segs: [max_shared]forward.Seg = undefined;
+        var pos0: [max_shared]usize = undefined;
+        var head: forward.HeadMode = .greedy;
+        var rows: usize = 0;
+        for (parts, 0..) |pt, i| {
+            for (parts[0..i]) |q| if (q.slot == pt.slot) return error.SlotTwice;
+            try e.bind(pt.slot);
+            const n = pt.ids.len;
+            if (n == 0 or n > pt.out.len or rows + n > forward.max_decode_rows) return error.BadSharedWindow;
+            if (e.mask_rows != 0) return error.UnexpectedMasks;
+            if (i == 0) head = e.f.head else if (!std.meta.eql(head, e.f.head)) return error.SharedHeadsDiffer;
+            if (e.pos + n > e.f.st.capacity) return error.ContextFull;
+            try e.flushDraftFill();
+            @memcpy(e.window[0..n], pt.ids);
+            e.window_rows = n;
+            pos0[i] = e.pos;
+            for (0..n) |j| {
+                positions[rows + j] = e.pos + j;
+                ids[rows + j] = pt.ids[j];
+            }
+            segs[i] = .{ .st = &e.views[pt.slot], .row0 = rows, .rows = n };
+            rows += n;
+        }
+        if (!verifyRowsAllowed(rows, e.f.st.ws.head_rows, rows)) return error.BadVerify;
+        if (e.mem.on) e.verify_windows += 1;
+        var f = e.f;
+        f.segs = segs[0..parts.len];
+        f.mask = .{};
+        f.taps = null;
+        f.ablate = null;
+        f.prof = null;
+        f.sink = null;
+        f.mk = null;
+        try f.prepare(.decode, positions[0..rows], ids[0..rows]);
+        try f.launch(.decode, positions[0..rows], .{ .start = 0, .end = rows });
+        e.last_outcome = .eager;
+        try e.readHead(f.stream, f.st.ws.head_gather, rows, rows * f.head.rowBytes());
+        var row: usize = 0;
+        for (parts, 0..) |pt, i| {
+            try e.bind(pt.slot);
+            try e.draw(row, pt.ids.len, pos0[i], pt.out[0..pt.ids.len]);
+            row += pt.ids.len;
+        }
     }
 
     /// TF_GLM53_NO_GRAPHS=1: decode windows run eagerly (diagnosis of graph replay vs eager on the full model).

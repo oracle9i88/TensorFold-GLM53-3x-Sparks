@@ -7,10 +7,24 @@ const std = @import("std");
 const cuda = @import("cuda");
 pub const max_decode_rows = 16;
 
-pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draw, end, release, cache_hit, rollback, prefill_rows, draft_block, park, unpark, snap_save, snap_load, snap_commit, prewarm_graph, masks = 18 };
+pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draw, end, release, cache_hit, rollback, prefill_rows, draft_block, park, unpark, snap_save, snap_load, snap_commit, prewarm_graph, masks = 18, verify_shared = 19 };
+
+/// TF_GLM53_SLOTS: request slots a follower binds at most (engine.max_shared). A frame names its slot in the high
+/// half of `protocol` (slot 0: protocol 1, the single-stream wire as before).
+pub const max_lanes = 8;
+
+pub fn withLane(h: Header, lane: usize) Header {
+    var x = h;
+    x.protocol = 1 | (@as(u32, @intCast(lane)) << 16);
+    return x;
+}
+
+pub fn laneOf(h: Header) usize {
+    return h.protocol >> 16;
+}
 
 pub fn hasPayload(kind: u32) bool {
-    return kind == @backingInt(Kind.begin) or kind == @backingInt(Kind.prefill) or kind == @backingInt(Kind.verify) or kind == @backingInt(Kind.cache_hit) or kind == @backingInt(Kind.prefill_rows) or kind == @backingInt(Kind.draft_block) or kind == @backingInt(Kind.park) or kind == @backingInt(Kind.unpark) or kind == @backingInt(Kind.snap_load) or kind == @backingInt(Kind.prewarm_graph) or kind == @backingInt(Kind.masks);
+    return kind == @backingInt(Kind.begin) or kind == @backingInt(Kind.prefill) or kind == @backingInt(Kind.verify) or kind == @backingInt(Kind.cache_hit) or kind == @backingInt(Kind.prefill_rows) or kind == @backingInt(Kind.draft_block) or kind == @backingInt(Kind.park) or kind == @backingInt(Kind.unpark) or kind == @backingInt(Kind.snap_load) or kind == @backingInt(Kind.prewarm_graph) or kind == @backingInt(Kind.masks) or kind == @backingInt(Kind.verify_shared);
 }
 
 
@@ -30,8 +44,9 @@ pub const Header = extern struct {
 pub const Link = struct {
     /// Host-testable wire validation. A follower must reject malformed rank-0 frames before touching its engine.
     pub fn validate(h: Header, ids: []const u32) !void {
-        if (h.protocol != 1) return error.ProtocolMismatch;
-        if (h.kind < @backingInt(Kind.begin) or h.kind > @backingInt(Kind.masks)) return error.BadKind;
+        if (h.protocol & 0xffff != 1) return error.ProtocolMismatch;
+        if (laneOf(h) >= max_lanes) return error.BadPayload;
+        if (h.kind < @backingInt(Kind.begin) or h.kind > @backingInt(Kind.verify_shared)) return error.BadKind;
         const payload_kind = hasPayload(h.kind);
 
         if (h.kind == @backingInt(Kind.begin) and h.slot > 1) return error.BadPayload;
@@ -67,7 +82,31 @@ pub const Link = struct {
     /// transport receives a complete frame before invoking it, so malformed commands fail closed.
     pub fn apply(engine: anytype, h: Header, ids: []const u32, out: []u32) !void {
         try Link.validate(h, ids);
+        // TF_GLM53_SLOTS: every frame runs on the slot rank 0 sent it from (slot 0 without slots).
+        if (comptime @hasDecl(@TypeOf(engine.*), "bind")) try engine.bind(laneOf(h)) else if (laneOf(h) != 0) return error.BadPayload;
         switch (@as(Kind, @fromBackingInt(@intCast(h.kind)))) {
+            .verify_shared => {
+                // [parts, then each part's slot, rows and input ids]; the parts' draws go to `out` in part order.
+                if (comptime !@hasDecl(@TypeOf(engine.*), "verifyShared")) return error.UnsupportedOperation;
+                const P = @TypeOf(engine.*).SharedPart;
+                var parts: [max_lanes]P = undefined;
+                if (ids.len == 0 or ids[0] == 0 or ids[0] > max_lanes) return error.BadPayload;
+                const n: usize = ids[0];
+                var at: usize = 1;
+                var row: usize = 0;
+                for (parts[0..n]) |*pt| {
+                    if (at + 2 > ids.len) return error.BadPayload;
+                    const slot: usize = ids[at];
+                    const rows: usize = ids[at + 1];
+                    at += 2;
+                    if (rows == 0 or at + rows > ids.len or row + rows > out.len) return error.BadPayload;
+                    pt.* = .{ .slot = slot, .ids = ids[at..][0..rows], .out = out[row..][0..rows] };
+                    at += rows;
+                    row += rows;
+                }
+                if (at != ids.len) return error.BadPayload;
+                try engine.verifyShared(parts[0..n]);
+            },
             .begin => {
                 const temp: u64 = ids[0] | (@as(u64, ids[1]) << 32);
                 const top_p: u64 = ids[3] | (@as(u64, ids[4]) << 32);

@@ -1493,6 +1493,9 @@ test "attention pipe switch accepts only the exact opt-in value" {
 /// WP8's routed-expert callback state: this layer's EXL3 weights and the forward's scratch.
 const Routed = struct { f: *const Forward, layer: experts.Loaded, mode: Mode = .decode };
 
+/// TF_GLM53_SLOTS shared decode: one request slot's rows [row0, row0 + rows) of the window, on its own cache view.
+pub const Seg = struct { st: *const state.State, row0: usize, rows: usize };
+
 pub const Forward = struct {
     gpa: std.mem.Allocator,
     k: *const Kernels,
@@ -1521,6 +1524,10 @@ pub const Forward = struct {
     mk: ?*const cuda.Stream.Deferred = null,
     ablate: ?*const ablate_mod.Ablation = null,
     taps: ?taps_mod.Taps = null,
+    /// TF_GLM53_SLOTS shared decode: the window's rows by request slot. The cache work (KV and indexer key writes,
+    /// key selection, attention over the cache) runs once a segment on its slot's view; everything else runs once
+    /// over the whole window. Empty: every row on `st`.
+    segs: []const Seg = &.{},
     /// null reads TF_GLM53_SIDE like production; tests can select the path without mutating process environment.
     decode_side: ?bool = null,
 
@@ -2332,6 +2339,11 @@ pub const Forward = struct {
         if (xn_off + rows > xn_rows) return error.ExpertBatchBounds;
         const xn = ws.xn + xn_off * hidden * 2;
         const pos = positions[p.start..p.end];
+        // TF_GLM53_SLOTS: a shared window is one decode piece on TP=3 (no cache-only split, no q/kv shard, no pipe);
+        // each segment's cache work below runs on its own slot view. Without slots there is one segment on `st`.
+        if (f.segs.len > 1 and (mode != .decode or cache_only or skip_cache or f.st.world != 3 or lo != 0 or pipe_slot != null or f.shardQkvAEnabled() or f.groupedPre(mode))) return error.SharedWindowUnsupported;
+        var one_seg: [1]Seg = undefined;
+        const segs = f.kvSegs(rows, &one_seg);
         const s = f.stream;
         const prefill = mode == .prefill;
         // The side stream is used for rounds of at most 8 rows (DFlash2 blocks). 12- and 16-row copy rounds
@@ -2445,7 +2457,7 @@ pub const Forward = struct {
         const stage: ?types.StagePlanePair = if (prefill and f.dcpWorld() > 1) f.st.stage.forLayer(plane).* else null;
         if (!skip_cache) {
             try f.profileSubBeginStream(mode, plane, .attn_pre_kv_a_norm_rope, if (side_on) side else s);
-            try k.mla.prep(if (side_on) side else s, ws.kv, a.kv_a_norm, cos, sin, positions_at, latent, rope, stage, rows, state.kv_a_width, f.dcpRank(), f.dcpWorld(), prefill);
+            for (segs) |g| try k.mla.prep(if (side_on) side else s, ws.kv + g.row0 * state.kv_a_width * 2, a.kv_a_norm, cos + g.row0 * rope_half * 4, sin + g.row0 * rope_half * 4, positions_at + g.row0 * 8, g.st.latentAt(plane), g.st.ropeAt(plane), stage, g.rows, state.kv_a_width, f.dcpRank(), f.dcpWorld(), prefill);
             try f.profileSubEndStream(mode, plane, .attn_pre_kv_a_norm_rope, if (side_on) side else s);
         }
         if (a.indexer) |ix| {
@@ -2459,7 +2471,7 @@ pub const Forward = struct {
                         try f.profileSubEndStream(mode, plane, .attn_pre_indexer_key_proj, side);
                     }
                     try f.profileSubBeginStream(mode, plane, .attn_pre_indexer_keys_write, side);
-                    try k.index.keys(side, ws.ik, ix.k_norm, ix.k_bias, cos, sin, positions_at, iplane, rows, index.dim, 0, f.dcpRank(), f.dcpWorld(), f.w.config.indexer_eps);
+                    for (segs) |g| try k.index.keys(side, ws.ik + g.row0 * index.dim * 2, ix.k_norm, ix.k_bias, cos + g.row0 * rope_half * 4, sin + g.row0 * rope_half * 4, positions_at + g.row0 * 8, g.st.indexAt(ordinal), g.rows, index.dim, 0, f.dcpRank(), f.dcpWorld(), f.w.config.indexer_eps);
                     try f.profileSubEndStream(mode, plane, .attn_pre_indexer_keys_write, side);
                     try (f.st.kv orelse return error.MissingDecodeSideEvents).record(side);
                     try s.wait(f.st.kv.?);
@@ -2470,7 +2482,7 @@ pub const Forward = struct {
                         try f.profileSubEnd(mode, plane, .attn_pre_indexer_key_proj);
                     }
                     try f.profileSubBegin(mode, plane, .attn_pre_indexer_keys_write);
-                    try k.index.keys(s, ws.ik, ix.k_norm, ix.k_bias, cos, sin, positions_at, iplane, rows, index.dim, 0, f.dcpRank(), f.dcpWorld(), f.w.config.indexer_eps);
+                    for (segs) |g| try k.index.keys(s, ws.ik + g.row0 * index.dim * 2, ix.k_norm, ix.k_bias, cos + g.row0 * rope_half * 4, sin + g.row0 * rope_half * 4, positions_at + g.row0 * 8, g.st.indexAt(ordinal), g.rows, index.dim, 0, f.dcpRank(), f.dcpWorld(), f.w.config.indexer_eps);
                     try f.profileSubEnd(mode, plane, .attn_pre_indexer_keys_write);
                 }
             }
@@ -2484,7 +2496,12 @@ pub const Forward = struct {
                 try f.project(mode, s, ws.q_resid, state.q_lora, rows, ix.wq_b, ws.iq, .bf16, ws.lane_part);
                 try k.index.q(s, ws.iq, cos, sin, ws.qi, rows);
                 try f.profileSubEnd(mode, plane, .attn_pre_indexer_query_proj);
-                try f.select(mode, plane, pos, lo, iplane);
+                if (f.segs.len == 0) {
+                    try f.select(mode, plane, pos, lo, iplane, 0);
+                } else for (segs) |g| {
+                    const gpos = pos[g.row0..][0..g.rows];
+                    if (sparseIn(gpos)) try f.select(mode, plane, gpos, lo + g.row0, g.st.indexAt(ordinal), g.row0);
+                }
             }
         } else if (side_on) {
             try (f.st.kv orelse return error.MissingDecodeSideEvents).record(side);
@@ -2545,7 +2562,9 @@ pub const Forward = struct {
             // Each rank attends its own local heads directly against local KV cache into ws.ol.
             try f.profileEnd(mode, plane, .attn_pre);
             try f.profileBegin(mode, plane, .attn_pre);
-            try k.mla.attend(s, qa, qpe, latent, rope, null, positions_at, tokens, ws.local_slots, counts, ws.local_counts, dense_len, ws.ol, rows, a.local_heads, 0, 1, false, ws.attend_split);
+            // Segments in order: a segment's LSE plane lands just past its rows, where the next segment's rows are
+            // written after it (TP=3 reads no LSE); the last one's lands where the whole window's would.
+            for (segs) |g| try k.mla.attend(s, qa + g.row0 * a.local_heads * mla.latent_dim * 2, qpe + g.row0 * a.local_heads * mla.rope_dim * 2, g.st.latentAt(plane), g.st.ropeAt(plane), null, positions_at + g.row0 * 8, tokens + g.row0 * index.top_k * 4, ws.local_slots + g.row0 * index.top_k * 4, counts + g.row0 * 4, ws.local_counts + g.row0 * 4, dense_len + g.row0 * 4, ws.ol + g.row0 * a.local_heads * mla.latent_dim * 2, g.rows, a.local_heads, 0, 1, false, ws.attend_split);
             try f.profileEnd(mode, plane, .attn_pre);
             try f.profileBegin(mode, plane, .expand_v);
             if (use_decode_mla and f.decodeMlaV2Enabled()) {
@@ -2624,7 +2643,16 @@ pub const Forward = struct {
     /// DSA selection on a full layer for one piece (rows `lo`.. of the window): local scores over this rank's
     /// keys, local exact top-2048 packed {score, position} records, one all-gather, then fused global merge/filter/
     /// remap into prefill tokens and DCP local slots. Scored in score_rows blocks.
-    fn select(f: *const Forward, mode: Mode, layer: usize, positions: []const usize, lo: usize, plane: u64) !void {
+    /// The segments a window's cache work runs over: f.segs, or one segment on `st` covering the piece's `rows`.
+    fn kvSegs(f: *const Forward, rows: usize, one: *[1]Seg) []const Seg {
+        if (f.segs.len != 0) return f.segs;
+        one.* = .{.{ .st = f.st, .row0 = 0, .rows = rows }};
+        return one[0..];
+    }
+
+    /// `qrow0`: the rows of ws.qi / ws.iw (the piece's index queries and weights) where `positions` start (0 but for a
+    /// TF_GLM53_SLOTS segment).
+    fn select(f: *const Forward, mode: Mode, layer: usize, positions: []const usize, lo: usize, plane: u64, qrow0: usize) !void {
         if (mode == .prefill and f.indexPipeEnabled()) return f.selectIndexPipe(mode, layer, positions, lo, plane);
         const ws = &f.st.ws;
         const k = f.k;
@@ -2643,7 +2671,7 @@ pub const Forward = struct {
             if (!sparseIn(positions[at..][0..n])) continue;
             const pos = ws.positions + (lo + at) * 8;
             try f.profileSubBegin(mode, layer, .attn_pre_indexer_scoring);
-            try index_k.scores(s, ws.qi + at * index.heads * index.dim * 2, ws.iw + at * index.heads * 2, index.heads, 0, plane, pos, ws.scores, n, nkeys, nkeys, f.dcpRank(), f.dcpWorld());
+            try index_k.scores(s, ws.qi + (qrow0 + at) * index.heads * index.dim * 2, ws.iw + (qrow0 + at) * index.heads * 2, index.heads, 0, plane, pos, ws.scores, n, nkeys, nkeys, f.dcpRank(), f.dcpWorld());
             try f.profileSubEnd(mode, layer, .attn_pre_indexer_scoring);
             try f.profileSubBegin(mode, layer, .attn_pre_indexer_topk);
             try k.index.topk(s, ws.scores, nkeys, ws.topk_tokens, ws.topk_counts, ws.candidate_records, pos, n, nkeys, index.top_k, f.dcpRank(), f.dcpWorld());

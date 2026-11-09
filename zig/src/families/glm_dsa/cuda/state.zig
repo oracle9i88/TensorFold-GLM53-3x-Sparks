@@ -1730,6 +1730,29 @@ pub const State = struct {
         }
     }
 
+    /// TF_GLM53_SLOTS: request slot `slot` of `count` as a State of its own. It shares every buffer, event and the
+    /// workspace; its cache planes start `slot * per` rows in (each layer's plane keeps the full `slots` stride, so
+    /// latentAt / ropeAt / indexAt land inside the slot) and hold `per - 2` positions (the sentinel rows stay inside
+    /// the slot). A view owns nothing: only the State it came from deinits. One slot is the State itself.
+    pub fn slotView(s: *const State, slot: usize, count: usize) !State {
+        if (count == 0 or slot >= count) return error.BadSlotView;
+        if (count == 1) return s.*;
+        if (s.adapt != null or s.park_slots != 0) return error.SlotViewUnsupported;
+        const per = s.slots / count;
+        if (per < 2048 + 2) return error.SlotViewTooSmall;
+        var v = s.*;
+        const row0: u64 = @intCast(slot * per);
+        const latent_skip = row0 * mla.latent_dim * 2;
+        const rope_skip = row0 * mla.rope_dim * 2;
+        const index_skip = row0 * index.dim * 2;
+        if (latent_skip > s.latent.len or rope_skip > s.rope.len or index_skip > s.index_keys.len) return error.BadSlotView;
+        v.latent = .{ .d = s.latent.d, .ptr = s.latent.ptr + latent_skip, .len = s.latent.len - @as(usize, @intCast(latent_skip)), .borrowed = true };
+        v.rope = .{ .d = s.rope.d, .ptr = s.rope.ptr + rope_skip, .len = s.rope.len - @as(usize, @intCast(rope_skip)), .borrowed = true };
+        v.index_keys = .{ .d = s.index_keys.d, .ptr = s.index_keys.ptr + index_skip, .len = s.index_keys.len - @as(usize, @intCast(index_skip)), .borrowed = true };
+        v.capacity = per - 2;
+        return v;
+    }
+
     /// Plane `layer`'s latent rows [slots][512] bf16 (`layer` < layers; Forward checks with checkLayers first).
     pub fn latentAt(s: *const State, layer: usize) u64 {
         std.debug.assert(layer < s.layers);
