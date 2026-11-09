@@ -36,6 +36,13 @@ pub fn confTempSwitch() !f64 {
     return parseConfTemp(std.mem.span(raw));
 }
 
+/// TF_GLM53_DRAFT_CHANCE_TEMP: the DFlash2 selector's softmax temperature for the chances (1: as trained, same range
+/// as the DSpark confidence temperature). DSpark never reads it.
+pub fn chanceTempSwitch() !f64 {
+    const raw = std.c.getenv("TF_GLM53_DRAFT_CHANCE_TEMP") orelse return 1.0;
+    return parseConfTemp(std.mem.span(raw));
+}
+
 /// Host mirror of tf_glm53_unpack_bf16_rows' inverse qmmf packing map.
 pub fn packedIndex(row: usize, col: usize, k: usize) usize {
     const rr = row % 64;
@@ -169,6 +176,11 @@ pub const Host = struct {
         const conf_temp = try confTempSwitch();
         h.dr.?.conf_temp = conf_temp;
         if (h.share.rank == 0) std.log.info("glm53 draft conf temp: {d:.3}", .{conf_temp});
+        // DFlash2's chance is the selector's softmax over its own 16 candidates, which runs hot next to the target's
+        // acceptance; dividing the scores by this temperature cools the chances only (the drafts stay the argmax).
+        const chance_temp = try chanceTempSwitch();
+        h.dr.?.temp = chance_temp;
+        if (h.share.rank == 0 and chance_temp != 1.0) std.log.info("TF_GLM53_DRAFT_CHANCE_TEMP={d:.3}: DFlash2 selector chances use this softmax temperature (drafts unchanged)", .{chance_temp});
         // Make slot 0 (its ring) now, on both ranks, before the after-load MemAvailable reading: a lazy allocation
         // during serving could fail on one rank only and leave the other in a collective.
         try h.dr.?.restart(0, 0);

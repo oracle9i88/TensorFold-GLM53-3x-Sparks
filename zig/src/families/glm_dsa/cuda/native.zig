@@ -1941,6 +1941,12 @@ fn settingsDigest(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, o: Option
     if (weights.headFp8()) hash.update("TF_GLM53_HEAD_FP8=1");
     if (glm.dflash_load.split3Switch()) hash.update("TF_GLM53_DRAFT_SPLIT3=1");
     if (absorbRowsWanted()) hash.update("TF_GLM53_ABSORB_ROWS=1");
+    // Every rank must cool the chances alike or their draft windows would part; 1 (off) hashes nothing.
+    const chance_temp = try drafts.chanceTempSwitch();
+    if (chance_temp != 1.0) {
+        hash.update("TF_GLM53_DRAFT_CHANCE_TEMP=");
+        hash.update(std.mem.asBytes(&chance_temp));
+    }
     try hashPrefixCacheSwitch(&hash, prefixCacheSwitch(), try expertRows());
     hashPromptExperts(&hash, prompt_experts);
     if (prompt_mla != .off) {
