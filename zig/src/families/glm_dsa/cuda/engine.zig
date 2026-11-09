@@ -886,6 +886,22 @@ pub const Engine = struct {
         return reusableRows(e.history.items, e.frontier, ids, grain);
     }
 
+    /// TF_GLM53_SLOTS with resident reuse: `reusablePrompt` on slot `slot`, read from its Seq while another slot
+    /// is bound (no bind: choosing a slot changes nothing on any rank).
+    pub fn reusableOn(e: *const Engine, slot: usize, ids: []const u32) usize {
+        const grain = if (e.reuse_grain == 0) e.f.st.ws.piece_rows else e.reuse_grain;
+        if (slot == e.bound) return reusableRows(e.history.items, e.frontier, ids, grain);
+        if (slot >= e.seqs.len) return 0;
+        return reusableRows(e.seqs[slot].history.items, e.seqs[slot].frontier, ids, grain);
+    }
+
+    /// TF_GLM53_SLOTS: the prefill rows slot `slot` keeps (its frontier).
+    pub fn frontierOn(e: *const Engine, slot: usize) usize {
+        if (slot == e.bound) return e.frontier;
+        if (slot >= e.seqs.len) return 0;
+        return e.seqs[slot].frontier;
+    }
+
     pub fn prefillResident(e: *Engine, ids: []const u32) !u32 {
         const r = e.reusablePrompt(ids);
         try e.rollback(r);

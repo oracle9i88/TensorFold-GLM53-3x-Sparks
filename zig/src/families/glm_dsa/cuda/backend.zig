@@ -454,9 +454,33 @@ pub fn Adapter(comptime Engine: type) type {
             return error.SingleStreamOnly;
         }
 
+        /// A free slot for a prompt, bound. With resident reuse, the free slot whose kept prefill shares the longest
+        /// reusable prefix with it; on a tie, the one that drops the fewest kept rows, so a long document stays for
+        /// its follow-ups while unrelated requests take the other slot. Without reuse: the first free slot.
+        fn bindFreeFor(b: *@This(), prompt: []const u32) !void {
+            if (b.slots == 1) return;
+            if (comptime @hasDecl(Engine, "reusableOn")) if (b.resident) {
+                var best: ?usize = null;
+                var best_reuse: usize = 0;
+                var best_drop: usize = 0;
+                for (0..b.slots) |i| {
+                    if (b.slotOwner(i) != null) continue;
+                    const reuse = b.e.reusableOn(i, prompt);
+                    const drop = b.e.frontierOn(i) -| reuse;
+                    if (best == null or reuse > best_reuse or (reuse == best_reuse and drop < best_drop)) {
+                        best = i;
+                        best_reuse = reuse;
+                        best_drop = drop;
+                    }
+                }
+                return b.bindLane(best orelse return error.SingleStreamOnly);
+            };
+            return b.bindFree();
+        }
+
         fn prefill(ptr: *anyopaque, s: *Stream) anyerror!void {
             const b = self(ptr);
-            try b.bindFree();
+            try b.bindFreeFor(s.prompt());
             b.first_tok = null;
             b.gpa.free(b.first_mask);
             b.first_mask = &.{};
@@ -465,6 +489,8 @@ pub fn Adapter(comptime Engine: type) type {
             // TF_GLM53_SLOTS: a server started with --drafter marks every stream drafted; slots serve them undrafted
             // (the facts say no head, so the lane core asks no drafts).
             if ((s.drafts and !b.drafting and b.slots == 1) or s.images.len > 0 or s.reuse.saved != null) return error.UnsupportedStreamFeatures;
+            // TF_GLM53_SLOTS: shared windows run unablated (Engine.verifyShared), so slots take no ablated stream.
+            if (b.slots > 1 and s.ablate) return error.UnsupportedStreamFeatures;
             b.held_n = 0;
             try arm(b, s);
             try parkStep(b, s.prompt(), s.ablate);

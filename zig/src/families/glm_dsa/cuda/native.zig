@@ -1444,9 +1444,12 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
             .ring_adopt_fn = drafts.Host.ringAdopt,
         };
     }
-    const resident = residentEnabled() and capture_dir == null and request_slots == 1;
+    // TF_GLM53_SLOTS: each slot keeps its own prefill rows for the next prompt it takes (a slot is chosen by prefix);
+    // TF_GLM53_SLOT_REUSE=0 turns that off, every slot's prompt prefilling from row 0.
+    const slot_reuse = request_slots == 1 or slotReuseEnabled();
+    const resident = residentEnabled() and capture_dir == null and slot_reuse;
     if (capture_dir != null and residentEnabled() and p.rank == 0) std.log.info("TF_GLM53_CAPTURE_DIR: resident reuse off (TF_GLM53_RESIDENT=1 ignored)", .{});
-    if (request_slots > 1 and residentEnabled() and p.rank == 0) std.log.info("TF_GLM53_SLOTS: resident reuse off (TF_GLM53_RESIDENT=1 ignored)", .{});
+    if (request_slots > 1 and residentEnabled() and !slot_reuse and p.rank == 0) std.log.info("TF_GLM53_SLOT_REUSE=0: resident reuse off (TF_GLM53_RESIDENT=1 ignored)", .{});
     own.engine.resident = resident;
     own.engine.reuse_grain = reuse_grain;
     if (side_rows != 0) own.engine.park = .{ .rows = side_rows, .adapt_limit = adapt_limit_position, .long_from = long_from };
@@ -1493,7 +1496,7 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
         own.adapter.drafting = slot_drafting;
         own.adapter.solo_drafts = slot_drafting and slot_drafts == .solo;
         own.adapter.slots = request_slots;
-        if (p.rank == 0) std.log.info("TF_GLM53_SLOTS={d}: {d} request slots of {d} positions on one cache; drafts {s}, resident reuse off, shared windows eager", .{ request_slots, request_slots, views[0].capacity, if (!slot_drafting) "off" else if (slot_drafts == .solo) "solo (a stream alone drafts; shared rounds feed each slot's ring)" else "all (the cost rule drafts shared rounds too)" });
+        if (p.rank == 0) std.log.info("TF_GLM53_SLOTS={d}: {d} request slots of {d} positions on one cache; drafts {s}, resident reuse {s}, shared windows eager", .{ request_slots, request_slots, views[0].capacity, if (!slot_drafting) "off" else if (slot_drafts == .solo) "solo (a stream alone drafts; shared rounds feed each slot's ring)" else "all (the cost rule drafts shared rounds too)", if (resident) "per slot (a prompt takes the free slot with the longest kept prefix)" else "off" });
     }
     own.adapter.draft_chances = own.alive_host and draftChancesSwitch();
     std.log.info("glm53 draft chances: {s}", .{if (own.adapter.draft_chances) "on" else "off"});
@@ -1731,6 +1734,12 @@ fn captureDirEnv() ?[]const u8 {
     const raw = std.c.getenv("TF_GLM53_CAPTURE_DIR") orelse return null;
     const value = std.mem.span(raw);
     return if (value.len == 0) null else value;
+}
+
+/// TF_GLM53_SLOT_REUSE (with TF_GLM53_SLOTS and TF_GLM53_RESIDENT=1): "0" turns per-slot resident reuse off.
+fn slotReuseEnabled() bool {
+    const value = std.c.getenv("TF_GLM53_SLOT_REUSE") orelse return true;
+    return !std.mem.eql(u8, std.mem.span(value), "0");
 }
 
 fn residentEnabled() bool {
