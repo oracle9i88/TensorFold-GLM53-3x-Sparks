@@ -555,6 +555,8 @@ const Owned = struct {
     prefix_cache_floor_bytes: u64 = 0,
     /// TF_GLM53_CAPTURE_DIR (rank 0): the engine's capture, freed here.
     capture: ?*engine_mod.capture_mod.Capture = null,
+    /// TF_GLM53_SLOTS with the drafter: each request slot's drafter hook context (its slot of the one DFlash2 drafter).
+    slot_lanes: []drafts.Host.Lane = &.{},
     alive_model: bool = false,
     alive_host: bool = false,
     alive_ablation: bool = false,
@@ -585,6 +587,7 @@ const Owned = struct {
         if (own.alive_stream) own.stream.synchronize() catch {};
         if (own.alive_side_stream) if (own.side_stream) |s| s.synchronize() catch {};
         if (own.alive_host) own.host.deinit();
+        if (own.slot_lanes.len != 0) own.gpa.free(own.slot_lanes);
         if (own.agree_flag) |*flag| flag.free();
         if (own.alive_state) own.st.deinit();
         if (own.alive_ablation) own.ablation.deinit();
@@ -961,6 +964,13 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
     const lowrank_decode = moe.decodeSwitch();
     const row_prune = envSwitch("TF_GLM53_ROW_PRUNE");
     const defer_draft_fill = envSwitch("TF_GLM53_DEFER_DRAFT_FILL");
+    // TF_GLM53_SLOTS: every slot's drafter reads the one prompt-tap buffer, so its prompt rows go in before another
+    // slot's prefill writes it (a deferred fill could take another slot's rows).
+    const slot_drafts = slotDraftsEnv() catch |err| {
+        std.log.err("TF_GLM53_SLOT_DRAFTS must be solo, all or 0", .{});
+        return err;
+    };
+    if (request_slots > 1 and slot_drafts != .off and defer_draft_fill) return error.SlotDraftsNeedNoDeferredFill;
     const decode_mla_mode = forward.decodeMlaModeSwitch();
     if (forward.megakernelSwitch() and decode_mla_mode != .off) {
         std.log.err("TF_GLM53_MK=1 and TF_GLM53_DECODE_MLA are incompatible", .{});
@@ -1456,22 +1466,34 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
         std.log.info("glm53 fine reuse: grain {d}", .{reuse_grain});
     }
     own.adapter.drafting = own.alive_host;
-    // TF_GLM53_SLOTS: request slots on views of the one cache; their windows share forwards (eager). Drafts stay off:
-    // a drafted row costs what another stream's row does, so a shared round spends its rows on the streams.
+    // TF_GLM53_SLOTS: request slots on views of the one cache; their windows share forwards (eager). With the
+    // drafter each slot drafts on its own ring of it. TF_GLM53_SLOT_DRAFTS: solo (default) drafts only a stream
+    // alone, a shared round's streams taking their kept rows into their rings; all lets the cost rule draft shared
+    // rounds too; 0 drafts nothing (the drafter unused).
     if (request_slots > 1) {
+        const slot_drafting = own.alive_host and slot_drafts != .off;
+        if (slot_drafting) {
+            own.slot_lanes = try gpa.alloc(drafts.Host.Lane, request_slots);
+            for (own.slot_lanes, 0..) |*l, i| {
+                l.* = .{ .host = &own.host, .slot = @intCast(i) };
+                // every slot's ring now, on every rank: a lazy allocation while serving could fail on one rank only
+                try own.host.dr.?.restart(@intCast(i), 0);
+            }
+        }
         const views = try gpa.alloc(state.State, request_slots);
         errdefer gpa.free(views);
         for (views, 0..) |*v, i| v.* = try own.st.slotView(i, request_slots);
         const seqs = try gpa.alloc(engine_mod.Seq, request_slots);
-        for (seqs) |*q| q.* = .{};
+        for (seqs, 0..) |*q, i| q.* = .{ .drafter = if (slot_drafting) laneDrafter(own.engine.drafter.?, &own.slot_lanes[i]) else null };
         own.engine.views = views;
         own.engine.seqs = seqs;
         own.engine.bound = 0;
         own.engine.f.st = &own.engine.views[0];
-        own.engine.drafter = null;
-        own.adapter.drafting = false;
+        own.engine.drafter = seqs[0].drafter;
+        own.adapter.drafting = slot_drafting;
+        own.adapter.solo_drafts = slot_drafting and slot_drafts == .solo;
         own.adapter.slots = request_slots;
-        if (p.rank == 0) std.log.info("TF_GLM53_SLOTS={d}: {d} request slots of {d} positions on one cache; drafts off, resident reuse off, shared windows eager", .{ request_slots, request_slots, views[0].capacity });
+        if (p.rank == 0) std.log.info("TF_GLM53_SLOTS={d}: {d} request slots of {d} positions on one cache; drafts {s}, resident reuse off, shared windows eager", .{ request_slots, request_slots, views[0].capacity, if (!slot_drafting) "off" else if (slot_drafts == .solo) "solo (a stream alone drafts; shared rounds feed each slot's ring)" else "all (the cost rule drafts shared rounds too)" });
     }
     own.adapter.draft_chances = own.alive_host and draftChancesSwitch();
     std.log.info("glm53 draft chances: {s}", .{if (own.adapter.draft_chances) "on" else "off"});
@@ -1673,6 +1695,35 @@ fn slotsEnv() !usize {
     const n = std.fmt.parseInt(usize, std.mem.span(raw), 10) catch return error.BadSlots;
     if (n == 0 or n > follow.max_lanes) return error.BadSlots;
     return n;
+}
+
+const SlotDrafts = enum { solo, all, off };
+
+/// TF_GLM53_SLOT_DRAFTS (with TF_GLM53_SLOTS and the drafter): solo (unset), all, or 0.
+fn slotDraftsEnv() !SlotDrafts {
+    const raw = std.c.getenv("TF_GLM53_SLOT_DRAFTS") orelse return .solo;
+    const v = std.mem.span(raw);
+    if (v.len == 0 or std.mem.eql(u8, v, "solo")) return .solo;
+    if (std.mem.eql(u8, v, "all")) return .all;
+    if (std.mem.eql(u8, v, "0")) return .off;
+    return error.BadSlotDrafts;
+}
+
+/// TF_GLM53_SLOTS: slot `lane.slot`'s engine Drafter: the base one's taps and window with that slot's hooks. No
+/// state export or adoption (slots keep no resident rows or saved prefixes).
+fn laneDrafter(base: engine_mod.Drafter, lane: *drafts.Host.Lane) engine_mod.Drafter {
+    var d = base;
+    d.ctx = lane;
+    d.restart_fn = drafts.Host.Lane.restartHook;
+    d.prompt_fn = drafts.Host.Lane.promptHook;
+    d.verify_fn = drafts.Host.Lane.verifyHook;
+    d.draft_fn = drafts.Host.Lane.draftHook;
+    d.verify_at_fn = drafts.Host.Lane.verifyAtHook;
+    d.absorb_fn = drafts.Host.Lane.absorbHook;
+    d.state_fn = null;
+    d.adopt_fn = null;
+    d.ring_adopt_fn = null;
+    return d;
 }
 
 /// TF_GLM53_CAPTURE_DIR: where rank 0 writes drafter training rows (unset or empty: off). See capture.zig.

@@ -161,6 +161,11 @@ pub const Drafter = struct {
     state_fn: ?*const fn (ctx: *anyopaque, dst: []u8) anyerror!i64 = null,
     adopt_fn: ?*const fn (ctx: *anyopaque, src: []const u8, from: i64) anyerror!void = null,
     ring_adopt_fn: ?*const fn (ctx: *anyopaque, from: i64) anyerror!void = null,
+    /// TF_GLM53_SLOTS (each slot's Drafter): a shared window's part wrote `rows` tap rows at row `row0` of taps_step
+    /// (`first`: the window's first part, the one verify every part shares). Null: shared windows tap nothing.
+    verify_at_fn: ?*const fn (ctx: *anyopaque, row0: usize, rows: usize, pos0: usize, first: bool) anyerror!void = null,
+    /// TF_GLM53_SLOTS: the `n` kept rows of the slot's last verify into its context, no drafts (a depth-0 round).
+    absorb_fn: ?*const fn (ctx: *anyopaque, pos: usize, n: usize) anyerror!void = null,
 };
 
 pub const Agreement = struct {
@@ -522,10 +527,24 @@ pub const Engine = struct {
         }
         if (!verifyRowsAllowed(rows, e.f.st.ws.head_rows, rows)) return error.BadVerify;
         if (e.mem.on) e.verify_windows += 1;
+        // Every part's slot drafter shares the one taps_step: the window's rows land there in row order (from the
+        // first row's position), each part's at its segment's row0, so each slot's context takes its kept rows.
+        var tapping = true;
+        for (parts) |pt| {
+            const d = e.slotDrafter(pt.slot) orelse {
+                tapping = false;
+                break;
+            };
+            if (d.verify_at_fn == null) tapping = false;
+        }
         var f = e.f;
         f.segs = segs[0..parts.len];
         f.mask = .{};
-        f.taps = null;
+        f.taps = if (tapping) blk: {
+            var t = e.slotDrafter(parts[0].slot).?.taps_step;
+            t.from = positions[0];
+            break :blk t;
+        } else null;
         f.ablate = null;
         f.prof = null;
         f.sink = null;
@@ -533,6 +552,10 @@ pub const Engine = struct {
         try f.prepare(.decode, positions[0..rows], ids[0..rows]);
         try f.launch(.decode, positions[0..rows], .{ .start = 0, .end = rows });
         e.last_outcome = .eager;
+        if (tapping) for (parts, segs[0..parts.len], 0..) |pt, sg, i| {
+            const d = e.slotDrafter(pt.slot).?;
+            try d.verify_at_fn.?(d.ctx, sg.row0, sg.rows, pos0[i], i == 0);
+        };
         try e.readHead(f.stream, f.st.ws.head_gather, rows, rows * f.head.rowBytes());
         var row: usize = 0;
         for (parts, 0..) |pt, i| {
@@ -540,6 +563,13 @@ pub const Engine = struct {
             try e.draw(row, pt.ids.len, pos0[i], pt.out[0..pt.ids.len]);
             row += pt.ids.len;
         }
+    }
+
+    /// TF_GLM53_SLOTS: slot `slot`'s drafter (the engine's own while that slot is bound).
+    fn slotDrafter(e: *const Engine, slot: usize) ?Drafter {
+        if (slot == e.bound) return e.drafter;
+        if (slot >= e.seqs.len) return null;
+        return e.seqs[slot].drafter;
     }
 
     /// TF_GLM53_NO_GRAPHS=1: decode windows run eagerly (diagnosis of graph replay vs eager on the full model).
@@ -1235,6 +1265,21 @@ pub const Engine = struct {
             e.tap_high = 0;
         }
         try d.draft_fn(d.ctx, pos, n, anchor, out, probs);
+        e.tapped = pos;
+        e.tap_high = @max(e.tap_high, pos);
+    }
+
+    /// TF_GLM53_SLOTS: draftBlock without the drafts: the kept rows go into the bound slot's drafter context only.
+    pub fn absorbBlock(e: *Engine, pos: usize, n: usize) !void {
+        const d = e.drafter orelse return error.NoDrafter;
+        const absorb = d.absorb_fn orelse return error.NoDrafterAbsorb;
+        if (pos > e.pos or n > forward.max_decode_rows or n > pos) return error.BadDraftBlock;
+        try e.flushDraftFill();
+        if (pos - n != e.tapped) {
+            try d.restart_fn(d.ctx, pos);
+            e.tap_high = 0;
+        }
+        try absorb(d.ctx, pos, n);
         e.tapped = pos;
         e.tap_high = @max(e.tap_high, pos);
     }

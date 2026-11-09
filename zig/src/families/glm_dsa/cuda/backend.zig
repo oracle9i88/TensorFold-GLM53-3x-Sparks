@@ -235,6 +235,9 @@ pub fn Adapter(comptime Engine: type) type {
         lanes: [follow.max_lanes]Lane = @splat(.{}),
         lane: usize = 0,
         first_tok: ?u32 = null,
+        /// TF_GLM53_SLOTS with the drafter (TF_GLM53_SLOT_DRAFTS unset or "solo"): only a stream alone drafts; a
+        /// shared round's streams take their kept rows into their drafter contexts (depth 0), ready to draft alone.
+        solo_drafts: bool = false,
 
         pub fn init(gpa: std.mem.Allocator, e: *Engine) @This() {
             return .{ .gpa = gpa, .e = e };
@@ -255,7 +258,7 @@ pub fn Adapter(comptime Engine: type) type {
         pub fn facts(b: *const @This()) lanes.Model {
             if (noDraftEnabled()) return .{ .exact_width = 1, .first_copy_rows = 1, .copy_drafts = false, .copy_match = 0, .verify_widths = true, .mtp = false, .speculate = false, .gpu_tokens = false, .max_streams = 1, .batch_rows = b.batch_cap };
             if (!b.drafting) return .{ .exact_width = b.copy_rows, .first_copy_rows = b.copy_rows, .copy_drafts = b.copy_rows > 1, .copy_match = @intCast(b.copy_match), .verify_widths = true, .mtp = false, .speculate = false, .gpu_tokens = false, .max_streams = @intCast(b.slots), .hidden_rows = b.slots > 1, .shared_costs = if (b.slots > 1) &gb10_verify_costs else &.{}, .batch_rows = if (b.slots > 1) @min(b.batch_cap, follow.max_decode_rows) else b.batch_cap, .copy_arbitrate = b.copyd, .copy_costs = if (b.copyd) &gb10_verify_costs else &.{} };
-            return .{ .exact_width = @max(b.copy_rows, 8), .first_copy_rows = b.copy_rows, .copy_drafts = b.copy_rows > 1, .copy_match = @intCast(b.copy_match), .verify_widths = true, .mtp = true, .speculate = true, .speculate_early = false, .drafts = 7, .draft_streams = true, .gpu_tokens = false, .max_streams = 1, .batch_rows = b.batch_cap, .draft_probabilities = b.draft_chances, .window_costs = if (b.draft_chances) b.costTable() else &.{}, .granted_depth = b.lane_chances and b.draft_chances, .copy_first = b.lane_chances and b.draft_chances, .plain_guard = b.live_costs and b.draft_chances, .lone_cost_tile = if (b.live_costs and b.draft_chances) live_cost_tile else 0, .copy_arbitrate = b.copyd, .copy_costs = if (b.copyd) b.costTable() else &.{} };
+            return .{ .exact_width = @max(b.copy_rows, 8), .first_copy_rows = b.copy_rows, .copy_drafts = b.copy_rows > 1, .copy_match = @intCast(b.copy_match), .verify_widths = true, .mtp = true, .speculate = true, .speculate_early = false, .drafts = 7, .draft_streams = true, .gpu_tokens = false, .max_streams = @intCast(b.slots), .hidden_rows = b.slots > 1, .shared_costs = if (b.slots > 1) &gb10_verify_costs else &.{}, .solo_drafts = b.solo_drafts, .batch_rows = if (b.slots > 1) @min(b.batch_cap, @max(b.copy_rows, 8)) else b.batch_cap, .draft_probabilities = b.draft_chances, .window_costs = if (b.draft_chances) b.costTable() else &.{}, .granted_depth = b.lane_chances and b.draft_chances, .copy_first = b.lane_chances and b.draft_chances, .plain_guard = b.live_costs and b.draft_chances, .lone_cost_tile = if (b.live_costs and b.draft_chances) live_cost_tile else 0, .copy_arbitrate = b.copyd, .copy_costs = if (b.copyd) b.costTable() else &.{} };
         }
 
         pub fn appendBegin(b: *@This(), ids: []const u32) !void {
@@ -778,7 +781,7 @@ pub fn Adapter(comptime Engine: type) type {
                 var head: @TypeOf(b.e.f.head) = .greedy;
                 for (windows, 0..) |w, k| {
                     try b.bindStream(w.stream);
-                    if (w.held != 0 or w.masks.len != 0 or w.parents != null or w.early) share = false;
+                    if (w.masks.len != 0 or w.parents != null or w.early) share = false;
                     if (k == 0) head = b.e.f.head else if (!std.meta.eql(head, b.e.f.head)) share = false;
                 }
                 if (!share) {
@@ -802,8 +805,12 @@ pub fn Adapter(comptime Engine: type) type {
                     const rows = w.rows();
                     if (rows > follow.max_decode_rows or rows > b.verify_max or o.sampled.len < rows or total + rows > follow.max_decode_rows) return error.WindowTooWide;
                     if (w.positions.len == rows and w.positions[0] != b.e.pos + 1) return error.PositionMismatch;
+                    if (w.held != 0 and !b.drafting) return error.UnsupportedWindow;
+                    if (w.held > b.held_n) return error.NoHeldDrafts;
                     ids[k][0] = w.pending;
-                    @memcpy(ids[k][1..][0..w.tokens.len], w.tokens);
+                    // the slot's held drafts (a stream that drafted alone, or its first drafts) or copy proposals
+                    const drafts = if (w.held > 0) b.held[0..w.held] else w.tokens;
+                    @memcpy(ids[k][1..][0..drafts.len], drafts);
                     parts[k] = .{ .slot = b.lane, .ids = ids[k][0..rows], .out = sampled[k][0..rows] };
                     frame[at] = @intCast(b.lane);
                     frame[at + 1] = @intCast(rows);
@@ -821,8 +828,14 @@ pub fn Adapter(comptime Engine: type) type {
                     try b.e.keep(rows);
                     b.window_start = start;
                     b.window_rows = @intCast(rows);
+                    if (b.drafting) b.verified_rows += rows;
                     @memcpy(o.sampled[0..rows], sampled[k][0..rows]);
-                    o.drafts = &.{};
+                    if (w.held > 0) {
+                        if (o.drafts.len < w.held) return error.WindowTooWide;
+                        @memcpy(o.drafts[0..w.held], ids[k][1..][0..w.held]);
+                    } else {
+                        o.drafts = &.{};
+                    }
                 }
             } else return error.SingleStreamOnly;
         }
@@ -841,8 +854,15 @@ pub fn Adapter(comptime Engine: type) type {
                 if (requests.len != 0) return error.MtpUnsupported;
                 return;
             }
-            if (requests.len != 1) return error.SingleStreamOnly;
-            const r = requests[0];
+            // TF_GLM53_SLOTS: a shared round asks every stream's head in one call; each drafts on its own slot.
+            if (requests.len != 1 and b.slots == 1) return error.SingleStreamOnly;
+            for (requests) |r| {
+                try b.bindStream(r.stream);
+                try b.draftOne(r);
+            }
+        }
+
+        fn draftOne(b: *@This(), r: be.DraftRequest) !void {
             if (b.owner != r.stream or r.lanes != null or r.early) return error.TreesNotBuilt;
             if (r.position == 0) return error.PositionMismatch;
             const pos: usize = @intCast(r.position - 1);
@@ -851,12 +871,23 @@ pub fn Adapter(comptime Engine: type) type {
                 if (pos != r.start + rows.len) return error.PositionMismatch;
             }
             var n: usize = 0;
-            const anchor = if (r.rows) |rows| a: {
+            if (r.rows) |rows| {
                 for (rows, 0..) |row, i| if (row != i) return error.TreesNotBuilt;
                 n = rows.len;
                 b.matched_drafts += n - 1;
-                break :a r.follow[n - 1];
-            } else try token(b, r.first orelse return error.NoFirstToken);
+            }
+            // TF_GLM53_SLOTS: a round that holds no drafts (a shared round's) takes its kept rows into the slot's
+            // drafter context and runs no block pass, so the stream drafts from its first round alone.
+            if (b.slots > 1 and r.depth == 0) {
+                if (comptime @hasDecl(Engine, "absorbBlock")) {
+                    const one = [_]u32{@intCast(n)};
+                    try emit(b, .absorb, pos, &one, 1);
+                    try b.e.absorbBlock(pos, n);
+                } else return error.UnsupportedOperation;
+                b.held_n = 0;
+                return;
+            }
+            const anchor = if (r.rows != null) r.follow[n - 1] else try token(b, r.first orelse return error.NoFirstToken);
             const ids = [_]u32{ @intCast(n), anchor };
             try emit(b, .draft_block, pos, &ids, 2);
             // The trace and the conf recal need the selector's features: a 32-slot buffer asks for them (dflash_select.zig).

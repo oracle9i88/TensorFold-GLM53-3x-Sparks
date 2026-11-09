@@ -279,7 +279,8 @@ pub const Engine = struct {
         for (whos, heads.items) |*w, i| w.* = win.who(plans[i].stream);
         const budgets = try a.alloc(i64, heads.items.len);
         const sampled = win.anySampled(plans);
-        try e.rule.budgets(whos, win.probe(e), sampled, budgets);
+        // solo drafts: a shared round's streams draft nothing (the backend takes their kept rows into their heads)
+        if (e.cfg.solo_drafts and plans.len > 1) @memset(budgets, 0) else try e.rule.budgets(whos, win.probe(e), sampled, budgets);
         const ids = try a.alloc(ev.Value, heads.items.len);
         for (ids, heads.items) |*id, i| id.* = str(plans[i].stream.id);
         try trail.event(e, &.{ f("ev", str("budgets")), f("streams", .{ .list = ids }), f("depths", .{ .i64s = budgets }) });

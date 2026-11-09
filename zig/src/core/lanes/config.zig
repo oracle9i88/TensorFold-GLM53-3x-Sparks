@@ -41,6 +41,7 @@ pub const Model = struct {
     copy_first: bool = false, // a copy ahead takes the round: the head holds no drafts for it
     hold_costs: []const @import("hold_price.zig").HoldCost = &.{}, // drafter's hold-pass costs by streams and depth
     draft_streams: bool = false, // the head drafts every stream of a shared round in one batch
+    solo_drafts: bool = false, // the head drafts only for a stream alone: a shared round's streams hold none (depth 0)
     head_trees: bool = false, // the head drafts trees of lanes (DraftRequest.lanes) and holds them
     join_tail: bool = false, // a prompt in pieces leaves its last token for the next shared round's window (Backend.join)
     piece_runs: bool = false, // a round's pieces go to the backend in one call (Backend.pieces: one forward over them)
@@ -76,6 +77,7 @@ pub const Config = struct {
     fill_match: u32 = 8, // context tokens a suffix-match branch must match (shorter ones are coincidental phrases)
     fill_floor: f64 = 0.35, // the share of grafted rows a stream must keep to go on reading its chain back every round
     draft_streams: bool,
+    solo_drafts: bool = false, // Model.solo_drafts
     head_trees: bool,
     verify_widths: bool = false, // Model.verify_widths
     /// a prompt in pieces leaves its last token as the pending row of its first shared round's window
@@ -160,6 +162,7 @@ pub const Config = struct {
             .node_probabilities = m.draft_probabilities or m.draft_confidence != null,
             .granted_depth = m.granted_depth and m.draft_probabilities,
             .draft_streams = m.draft_streams,
+            .solo_drafts = m.solo_drafts,
             .head_trees = m.head_trees,
             .join_tail = m.join_tail,
             .piece_runs = m.piece_runs,

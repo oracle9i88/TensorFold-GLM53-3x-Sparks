@@ -250,6 +250,47 @@ pub const Host = struct {
         try h.dr.?.draft(h, &[1]glm.dflash.Req{.{ .slot = 0, .pos = @intCast(pos), .n = n, .anchor = anchor, .out = out, .probs = probs }});
     }
 
+    /// TF_GLM53_SLOTS: one request slot's hooks. Each slot's engine Drafter carries one of these as its ctx, so the
+    /// slot's prompt, verify rows and drafts go to its own ring (slot `slot` of the one DFlash2 drafter).
+    pub const Lane = struct {
+        host: *Host,
+        slot: u32,
+
+        pub fn restartHook(ctx: *anyopaque, from: usize) anyerror!void {
+            const l: *Lane = @ptrCast(@alignCast(ctx));
+            try l.host.dr.?.restart(l.slot, from);
+        }
+
+        pub fn promptHook(ctx: *anyopaque, start: usize, rows: usize) anyerror!void {
+            const l: *Lane = @ptrCast(@alignCast(ctx));
+            try l.host.dr.?.prompt(l.host, l.slot, start, rows, start + rows);
+        }
+
+        pub fn verifyHook(ctx: *anyopaque, rows: usize, pos0: usize) anyerror!void {
+            const l: *Lane = @ptrCast(@alignCast(ctx));
+            try l.host.dr.?.noteVerify(l.slot, 0, rows, pos0, true);
+        }
+
+        /// A shared window's part: this slot's `rows` tap rows sit at row `row0` of taps_step; `first` counts the
+        /// window's one verify (its first part only), so every part's rows stay current until the next verify.
+        pub fn verifyAtHook(ctx: *anyopaque, row0: usize, rows: usize, pos0: usize, first: bool) anyerror!void {
+            const l: *Lane = @ptrCast(@alignCast(ctx));
+            try l.host.dr.?.noteVerify(l.slot, row0, rows, pos0, first);
+        }
+
+        pub fn draftHook(ctx: *anyopaque, pos: usize, n: usize, anchor: u32, out: ?[]u32, probs: ?[]f64) anyerror!void {
+            const l: *Lane = @ptrCast(@alignCast(ctx));
+            try l.host.dr.?.draft(l.host, &[1]glm.dflash.Req{.{ .slot = l.slot, .pos = @intCast(pos), .n = n, .anchor = anchor, .out = out, .probs = probs }});
+        }
+
+        /// A depth-0 round in a shared window: the `n` kept rows of the slot's last verify into its ring, no block
+        /// pass. Its context stays current, so the stream drafts from its first round alone.
+        pub fn absorbHook(ctx: *anyopaque, pos: usize, n: usize) anyerror!void {
+            const l: *Lane = @ptrCast(@alignCast(ctx));
+            try l.host.dr.?.absorb(l.host, l.slot, @intCast(pos), n);
+        }
+    };
+
     /// Export the preallocated DFlash2 ring through host memory; this does not allocate device memory.
     pub fn stateHook(ctx: *anyopaque, dst: []u8) anyerror!i64 {
         const h: *Host = @ptrCast(@alignCast(ctx));

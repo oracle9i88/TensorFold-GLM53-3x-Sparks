@@ -382,6 +382,19 @@ pub const Drafter = struct {
         try block.ingestPass(dr, e, N);
     }
 
+    /// The `n` kept rows of slot `i`'s last verify into its context and no block pass (a round that holds no drafts).
+    /// Rows already overwritten restart the context at `pos`, as `draft` does.
+    pub fn absorb(dr: *Drafter, e: anytype, i: u32, pos: i64, n: usize) !void {
+        const s = try dr.slot(i);
+        if (n == 0) return;
+        if (s.v_step != dr.verifies or n > s.v_rows or s.v_pos0 + @as(i64, @intCast(n)) != pos) {
+            s.from = pos;
+            dr.lost += 1;
+            return;
+        }
+        try dr.ingest(e, &.{.{ .ring = s.ring.?.ptr, .taps = dr.taps_step + s.v_row0 * dr.geometry.tapRowBytes(), .n = n, .pos0 = s.v_pos0 }});
+    }
+
     /// Kept rows into each context, then the block pass for every stream (every rank); rank 0 selects 7 drafts each.
     pub fn draft(dr: *Drafter, e: anytype, reqs: []const Req) !void {
         if (reqs.len == 0) return;
