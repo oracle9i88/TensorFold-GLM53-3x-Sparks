@@ -1942,8 +1942,21 @@ pub const Forward = struct {
         const ws = &f.st.ws;
         const rows = positions.len;
         if (rows == 0 or tokens.len != rows or rows > ws.rows) return error.BadForwardShape;
-        for (positions[1..], 0..) |p, i| if (p <= positions[i]) return error.NonAscendingPositions;
-        if (positions[rows - 1] >= f.st.capacity) return error.ContextFull;
+        if (f.segs.len > 1) {
+            // TF_GLM53_SLOTS: positions ascend within each slot's segment (each slot counts from its own 0).
+            var next: usize = 0;
+            for (f.segs) |g| {
+                if (g.rows == 0 or g.row0 != next or g.row0 + g.rows > rows) return error.BadForwardShape;
+                const sp = positions[g.row0..][0..g.rows];
+                for (sp[1..], 0..) |p, i| if (p <= sp[i]) return error.NonAscendingPositions;
+                if (sp[sp.len - 1] >= g.st.capacity) return error.ContextFull;
+                next = g.row0 + g.rows;
+            }
+            if (next != rows) return error.BadForwardShape;
+        } else {
+            for (positions[1..], 0..) |p, i| if (p <= positions[i]) return error.NonAscendingPositions;
+            if (positions[rows - 1] >= f.st.capacity) return error.ContextFull;
+        }
         const vocab_local = @max(f.w.vocab.len(), 1);
         var storage: RowInputs.DecodeStorage = .{};
         var in: RowInputs = if (mode == .decode) blk: {

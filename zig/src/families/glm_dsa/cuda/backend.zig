@@ -459,7 +459,9 @@ pub fn Adapter(comptime Engine: type) type {
             b.first_mask = &.{};
             if (comptime @hasDecl(Engine, "clearMasks")) b.e.clearMasks();
             if (b.owner != null) return error.SingleStreamOnly;
-            if ((s.drafts and !b.drafting) or s.images.len > 0 or s.reuse.saved != null) return error.UnsupportedStreamFeatures;
+            // TF_GLM53_SLOTS: a server started with --drafter marks every stream drafted; slots serve them undrafted
+            // (the facts say no head, so the lane core asks no drafts).
+            if ((s.drafts and !b.drafting and b.slots == 1) or s.images.len > 0 or s.reuse.saved != null) return error.UnsupportedStreamFeatures;
             b.held_n = 0;
             try arm(b, s);
             try parkStep(b, s.prompt(), s.ablate);
