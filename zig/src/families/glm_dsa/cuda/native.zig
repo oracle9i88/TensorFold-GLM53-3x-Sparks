@@ -463,6 +463,9 @@ pub const Loaded = struct {
     proposer_make: ?*const fn (*anyopaque, std.mem.Allocator, []const u32, []const u32) anyerror!lanes.proposer.Proposer = null,
     proposer_free: ?*const fn (*anyopaque, lanes.proposer.Proposer) void = null,
     ablate: bool = false,
+    /// TF_GLM53_SLOT_SIZES: the lane host's admission check (a free slot holds the request), else none.
+    admit_ctx: ?*anyopaque = null,
+    admit_fits: ?*const fn (*anyopaque, u32, u32) bool = null,
 };
 pub const ZngramEnv = struct { copy_rows: u32, min_match: u32, cap: u32, max_draft: u32, log: bool };
 pub fn verifyMaxFromEnv(get: anytype) !usize {
@@ -925,19 +928,21 @@ const LoadSteps = struct {
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, unused: ?[]const u8, o: Options) !Loaded {
     // TF_GLM53_SLOTS=N: --context is each request slot's window; one cache holds the N slots (each `context + 2`
     // rows, the sentinel rows inside its slot), so everything below sizes for N * (context + 2) - 2 positions.
-    const slots = slotsEnv() catch |err| {
-        std.log.err("GLM-5.3 native open failed: TF_GLM53_SLOTS must be 1..{d}", .{follow.max_lanes});
+    // TF_GLM53_SLOT_SIZES=a,b,..: slots of those windows instead (--context is the largest), sum(size + 2) - 2.
+    const plan = slotPlan(o.context) catch |err| {
+        std.log.err("GLM-5.3 native open failed: TF_GLM53_SLOTS must be 1..{d}; TF_GLM53_SLOT_SIZES needs 2..{d} windows of at least 2048, the largest equal to --context", .{ follow.max_lanes, follow.max_lanes });
         return err;
     };
     var whole = o;
-    if (slots > 1) whole.context = slots * (o.context + 2) - 2;
-    return openInner(gpa, io, ctx, dir, unused, whole, slots) catch |err| {
+    if (plan.count > 1) whole.context = plan.whole;
+    return openInner(gpa, io, ctx, dir, unused, whole, plan) catch |err| {
         std.log.err("GLM-5.3 native open failed: {s}", .{@errorName(err)});
         return err;
     };
 }
 
-fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, _: ?[]const u8, o: Options, request_slots: usize) !Loaded {
+fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, _: ?[]const u8, o: Options, slot_plan: SlotPlan) !Loaded {
+    const request_slots = slot_plan.count;
     try validateOptions(o);
     const reuse_grain = try fineReuseGrain();
     if (reuse_grain != 0 and !residentEnabled()) return error.FineReuseNeedsResident;
@@ -1104,9 +1109,11 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
     if (p.world == 3) {
         // TP=3 runs DCP=1: every rank keeps every position, so one rank's indexer scores the whole window, and the
         // park, prefix-cache and ablation paths (which address slot p / 2 or sum two partials) do not apply.
+        // With request slots each slot's rows score only that slot's keys: the limit is the widest slot's window.
         const cap = state.dcp1MaxContext(geometry);
-        if (o.context > cap) {
-            std.log.err("TP=3 (DCP=1): the indexer scores at most {d} keys per rank, so --context must be <= {d} (got {d})", .{ cap, cap, o.context });
+        const scored = if (slot_plan.count > 1) slot_plan.widest() else o.context;
+        if (scored > cap) {
+            std.log.err("TP=3 (DCP=1): the indexer scores at most {d} keys per rank, so --context must be <= {d} (got {d})", .{ cap, cap, scored });
             return error.Tp3ContextPastIndexLimit;
         }
         if (side_rows != 0) return error.Tp3SideRowsNeedDcp2;
@@ -1485,7 +1492,11 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
         }
         const views = try gpa.alloc(state.State, request_slots);
         errdefer gpa.free(views);
-        for (views, 0..) |*v, i| v.* = try own.st.slotView(i, request_slots);
+        var row0: usize = 0;
+        for (views, 0..) |*v, i| {
+            v.* = try own.st.slotViewRows(row0, slot_plan.sizes[i] + 2);
+            row0 += slot_plan.sizes[i] + 2;
+        }
         const seqs = try gpa.alloc(engine_mod.Seq, request_slots);
         for (seqs, 0..) |*q, i| q.* = .{ .drafter = if (slot_drafting) laneDrafter(own.engine.drafter.?, &own.slot_lanes[i]) else null };
         own.engine.views = views;
@@ -1496,6 +1507,7 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
         own.adapter.drafting = slot_drafting;
         own.adapter.solo_drafts = slot_drafting and slot_drafts == .solo;
         own.adapter.slots = request_slots;
+        if (p.rank == 0) for (views, 0..) |v, i| std.log.info("TF_GLM53_SLOTS: slot {d} holds {d} positions", .{ i, v.capacity });
         if (p.rank == 0) std.log.info("TF_GLM53_SLOTS={d}: {d} request slots of {d} positions on one cache; drafts {s}, resident reuse {s}, shared windows eager", .{ request_slots, request_slots, views[0].capacity, if (!slot_drafting) "off" else if (slot_drafts == .solo) "solo (a stream alone drafts; shared rounds feed each slot's ring)" else "all (the cost rule drafts shared rounds too)", if (resident) "per slot (a prompt takes the free slot with the longest kept prefix)" else "off" });
     }
     own.adapter.draft_chances = own.alive_host and draftChancesSwitch();
@@ -1689,7 +1701,53 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
         std.log.info("TF_GLM53_CAPTURE_DIR={s}: rank 0 writes each request's drafter tap rows and final residual rows (drafter training)", .{cdir});
     }
     const zon = ze.copy_rows > 1;
-    return .{ .backend = own.adapter.backend(), .ctx = own, .deinit = close, .stream_bytes = @intCast(admission.state_bytes + (if (drafter_geometry) |g| drafts.ringBytes(g) else 0)), .facts = own.adapter.facts(), .target = &own.engine, .proposer_ctx = if (zon) &own.zfactory else null, .proposer_make = if (zon) zngram.Factory.make else null, .proposer_free = if (zon) zngram.Factory.free else null, .ablate = own.alive_ablation, .free_streams = @intCast(request_slots) };
+    return .{ .backend = own.adapter.backend(), .ctx = own, .deinit = close, .stream_bytes = @intCast(admission.state_bytes + (if (drafter_geometry) |g| drafts.ringBytes(g) else 0)), .facts = own.adapter.facts(), .target = &own.engine, .proposer_ctx = if (zon) &own.zfactory else null, .proposer_make = if (zon) zngram.Factory.make else null, .proposer_free = if (zon) zngram.Factory.free else null, .ablate = own.alive_ablation, .free_streams = @intCast(request_slots), .admit_ctx = if (slot_plan.sized) @as(*anyopaque, &own.adapter) else null, .admit_fits = if (slot_plan.sized) Adapter.fits else null };
+}
+
+/// Request slots and their windows: TF_GLM53_SLOT_SIZES (windows that may differ, --context the largest), else
+/// TF_GLM53_SLOTS of --context each (unset: one slot, the whole cache).
+const SlotPlan = struct {
+    count: usize = 1,
+    sizes: [follow.max_lanes]usize = @splat(0),
+    whole: usize = 0,
+    sized: bool = false, // the windows differ: admission checks which slot a request fits
+
+    fn widest(p: SlotPlan) usize {
+        var w: usize = 0;
+        for (p.sizes[0..p.count]) |n| w = @max(w, n);
+        return w;
+    }
+};
+
+fn slotPlan(context: usize) !SlotPlan {
+    var p: SlotPlan = .{};
+    if (std.c.getenv("TF_GLM53_SLOT_SIZES")) |raw| {
+        p.count = 0;
+        var it = std.mem.splitScalar(u8, std.mem.span(raw), ',');
+        while (it.next()) |field| {
+            const t = std.mem.trim(u8, field, " ");
+            if (t.len == 0) continue;
+            if (p.count == follow.max_lanes) return error.BadSlotSizes;
+            const n = std.fmt.parseInt(usize, t, 10) catch return error.BadSlotSizes;
+            if (n < 2048) return error.BadSlotSizes;
+            p.sizes[p.count] = n;
+            p.count += 1;
+        }
+        if (p.count < 2) return error.BadSlotSizes;
+        if (std.c.getenv("TF_GLM53_SLOTS") != null and try slotsEnv() != p.count) return error.BadSlotSizes;
+        if (p.widest() != context) return error.SlotSizesNeedContext;
+        for (p.sizes[1..p.count]) |n| p.sized = p.sized or n != p.sizes[0];
+    } else {
+        p.count = try slotsEnv();
+        for (p.sizes[0..p.count]) |*n| n.* = context;
+    }
+    if (p.count == 1) {
+        p.whole = context;
+    } else {
+        for (p.sizes[0..p.count]) |n| p.whole += n + 2;
+        p.whole -= 2;
+    }
+    return p;
 }
 
 /// TF_GLM53_SLOTS: request slots, each `--context` positions on its own view of one cache (unset: 1, one stream).

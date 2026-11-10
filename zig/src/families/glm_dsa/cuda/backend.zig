@@ -457,30 +457,58 @@ pub fn Adapter(comptime Engine: type) type {
         /// A free slot for a prompt, bound. With resident reuse, the free slot whose kept prefill shares the longest
         /// reusable prefix with it; on a tie, the one that drops the fewest kept rows, so a long document stays for
         /// its follow-ups while unrelated requests take the other slot. Without reuse: the first free slot.
-        fn bindFreeFor(b: *@This(), prompt: []const u32) !void {
+        /// TF_GLM53_SLOT_SIZES: only a free slot that holds the prompt and its reply (`need` positions) takes it;
+        /// among those, the longest reusable prefix, then the smallest window (the large one stays for long
+        /// prompts), then the fewest kept rows dropped. None free that fits: LaneMemory when a busy one would (the
+        /// lane host queues the request again), ContextFull when none could.
+        fn bindFreeFor(b: *@This(), prompt: []const u32, need: usize) !void {
             if (b.slots == 1) return;
-            if (comptime @hasDecl(Engine, "reusableOn")) if (b.resident) {
-                var best: ?usize = null;
-                var best_reuse: usize = 0;
-                var best_drop: usize = 0;
-                for (0..b.slots) |i| {
-                    if (b.slotOwner(i) != null) continue;
-                    const reuse = b.e.reusableOn(i, prompt);
-                    const drop = b.e.frontierOn(i) -| reuse;
-                    if (best == null or reuse > best_reuse or (reuse == best_reuse and drop < best_drop)) {
-                        best = i;
-                        best_reuse = reuse;
-                        best_drop = drop;
-                    }
+            const reuse_on = comptime @hasDecl(Engine, "reusableOn");
+            var best: ?usize = null;
+            var best_reuse: usize = 0;
+            var best_cap: usize = 0;
+            var best_drop: usize = 0;
+            var widest: usize = 0;
+            for (0..b.slots) |i| {
+                const cap = b.slotCapacity(i);
+                widest = @max(widest, cap);
+                if (b.slotOwner(i) != null or need > cap) continue;
+                const reuse = if (reuse_on and b.resident) b.e.reusableOn(i, prompt) else 0;
+                const drop = if (reuse_on and b.resident) b.e.frontierOn(i) -| reuse else 0;
+                if (best == null or reuse > best_reuse or (reuse == best_reuse and (cap < best_cap or (cap == best_cap and drop < best_drop)))) {
+                    best = i;
+                    best_reuse = reuse;
+                    best_cap = cap;
+                    best_drop = drop;
                 }
-                return b.bindLane(best orelse return error.SingleStreamOnly);
-            };
-            return b.bindFree();
+            }
+            if (best) |i| return b.bindLane(i);
+            return if (need <= widest) error.LaneMemory else error.ContextFull;
+        }
+
+        /// A slot's window: its cache view's capacity (no views: the one cache's).
+        fn slotCapacity(b: *const @This(), i: usize) usize {
+            if (comptime @hasField(Engine, "views")) {
+                if (i < b.e.views.len) return b.e.views[i].capacity;
+            }
+            if (comptime @hasField(Engine, "f")) return b.e.f.st.capacity;
+            return std.math.maxInt(usize);
+        }
+
+        /// TF_GLM53_SLOT_SIZES: the lane host's admission check: a free slot holds `prompt` and `max_new` now.
+        pub fn fits(ptr: *anyopaque, prompt: u32, max_new: u32) bool {
+            const b = self(ptr);
+            if (b.slots == 1) return true;
+            const need = @as(usize, prompt) + max_new;
+            for (0..b.slots) |i| {
+                if (b.slotOwner(i) == null and need <= b.slotCapacity(i)) return true;
+            }
+            return false;
         }
 
         fn prefill(ptr: *anyopaque, s: *Stream) anyerror!void {
             const b = self(ptr);
-            try b.bindFreeFor(s.prompt());
+            try b.bindFreeFor(s.prompt(), s.prompt().len + s.max_new);
             b.first_tok = null;
             b.gpa.free(b.first_mask);
             b.first_mask = &.{};

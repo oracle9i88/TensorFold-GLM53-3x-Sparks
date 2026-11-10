@@ -1737,11 +1737,19 @@ pub const State = struct {
     pub fn slotView(s: *const State, slot: usize, count: usize) !State {
         if (count == 0 or slot >= count) return error.BadSlotView;
         if (count == 1) return s.*;
-        if (s.adapt != null or s.park_slots != 0) return error.SlotViewUnsupported;
         const per = s.slots / count;
-        if (per < 2048 + 2) return error.SlotViewTooSmall;
+        return s.slotViewRows(slot * per, per);
+    }
+
+    /// TF_GLM53_SLOT_SIZES: a view of rows row0.. (`rows` of them, the two sentinel rows inside) of every layer's
+    /// planes, for request slots of different sizes; capacity rows - 2. The per-layer stride stays the whole cache's.
+    pub fn slotViewRows(s: *const State, row0_rows: usize, rows: usize) !State {
+        if (s.adapt != null or s.park_slots != 0) return error.SlotViewUnsupported;
+        if (rows < 2048 + 2) return error.SlotViewTooSmall;
+        if (row0_rows + rows > s.slots) return error.BadSlotView;
+        const per = rows;
         var v = s.*;
-        const row0: u64 = @intCast(slot * per);
+        const row0: u64 = @intCast(row0_rows);
         const latent_skip = row0 * mla.latent_dim * 2;
         const rope_skip = row0 * mla.rope_dim * 2;
         const index_skip = row0 * index.dim * 2;

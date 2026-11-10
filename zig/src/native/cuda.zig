@@ -476,7 +476,10 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     }
     errdefer if (h.recording) |r| r.free(gpa);
     // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
-    const admit: ?api.Admit = if (comptime !@hasDecl(F, "fits")) null else if (paged != null) .{ .ctx = loaded.ctx, .fits = F.fits } else null;
+    const paged_admit: ?api.Admit = if (comptime !@hasDecl(F, "fits")) null else if (paged != null) .{ .ctx = loaded.ctx, .fits = F.fits } else null;
+    // A family's own admission check (GLM-5.3 TF_GLM53_SLOT_SIZES: request slots of different windows).
+    const own_admit: ?api.Admit = if (comptime @hasField(@TypeOf(loaded), "admit_fits")) (if (loaded.admit_fits) |fits| api.Admit{ .ctx = loaded.admit_ctx.?, .fits = fits } else null) else null;
+    const admit: ?api.Admit = own_admit orelse paged_admit;
     try h.serve(io, served.facts, loaded.rows, .{
         .lanes = streams,
         .context_window = @intCast(window),
