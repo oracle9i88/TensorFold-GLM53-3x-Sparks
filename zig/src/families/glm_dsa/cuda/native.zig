@@ -17,6 +17,7 @@ const uma = @import("uma");
 const glm_config = @import("glm_config");
 const backend_adapter = @import("backend");
 const slot_pool = backend_adapter.slot_pool;
+const fill_plan = backend_adapter.fill_plan;
 const manifest_mod = weights.manifest;
 const follow = @import("glm_follow");
 const prewarm = @import("prewarm");
@@ -1515,6 +1516,16 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
         own.adapter.drafting = slot_drafting;
         own.adapter.solo_drafts = slot_drafting and slot_drafts == .solo;
         own.adapter.slots = request_slots;
+        // TF_GLM53_FILL_ROWS / _ALONE / _SHARE: prompts go in by pieces between the other streams' rounds.
+        const fill = try fillSettings(chunk_rows);
+        own.adapter.fill_rows = fill.rows;
+        own.adapter.fill_rows_alone = fill.alone;
+        own.adapter.fill_share = fill.share;
+        if (p.rank == 0) {
+            if (fill.rows == 0) {
+                std.log.info("TF_GLM53_FILL_ROWS=0: a prompt goes in whole (every other stream waits for its pass)", .{});
+            } else std.log.info("TF_GLM53_FILL: a prompt goes in by pieces of {d} rows while other streams decode (the pass takes {d:.2} of the time), {d} rows back to back alone; pieces end on the {d}-row chunk grid", .{ fill.rows, fill.share, fill.alone, chunk_rows });
+        }
         if (slot_plan.pool != 0) {
             var ledger = try slot_pool.Ledger.init(own.st.slots, request_slots);
             ledger.big = slot_plan.pool_big;
@@ -1783,6 +1794,25 @@ fn slotPlan(context: usize) !SlotPlan {
         p.whole -= 2;
     }
     return p;
+}
+
+/// TF_GLM53_FILL_ROWS (default the larger of 4096 and the chunk rows), TF_GLM53_FILL_ALONE (twice that) and
+/// TF_GLM53_FILL_SHARE (0.5): with request slots, prompt pieces while others decode, alone, and the pass's share of the
+/// time. Piece rows are whole chunks of the engine's grid; TF_GLM53_FILL_ROWS=0 passes prompts whole.
+const FillSettings = struct { rows: usize, alone: usize, share: f64 };
+
+fn fillSettings(chunk_rows: usize) !FillSettings {
+    const base = @max(4096, chunk_rows);
+    const rows = try fillRowsEnv("TF_GLM53_FILL_ROWS", base);
+    const alone = try fillRowsEnv("TF_GLM53_FILL_ALONE", 2 * base);
+    const share = try fill_plan.parseShare(if (std.c.getenv("TF_GLM53_FILL_SHARE")) |v| std.mem.span(v) else null);
+    if (!fill_plan.validRows(rows, chunk_rows) or !fill_plan.validRows(alone, chunk_rows)) return error.FillRowsNotChunks;
+    return .{ .rows = rows, .alone = if (rows == 0) 0 else @max(alone, rows), .share = share };
+}
+
+fn fillRowsEnv(name: [*:0]const u8, default: usize) !usize {
+    const raw = std.c.getenv(name) orelse return default;
+    return std.fmt.parseInt(usize, std.mem.trim(u8, std.mem.span(raw), " "), 10) catch error.BadFillRows;
 }
 
 /// TF_GLM53_SLOTS: request slots, each `--context` positions on its own view of one cache (unset: 1, one stream).

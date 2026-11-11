@@ -23,6 +23,8 @@ const prefix_cache = @import("prefix_cache");
 pub const recal = @import("recal.zig");
 /// TF_GLM53_POOL: request slots claiming rows of one shared cache (the ledger and its planner).
 pub const slot_pool = @import("slot_pool.zig");
+/// TF_GLM53_FILL_*: with request slots, a prompt's pass in pieces between the other streams' rounds.
+pub const fill_plan = @import("fill_plan.zig");
 test { _ = recal; }
 
 pub const DiskHit = struct { at: usize, key: u64, files: usize = 1 };
@@ -236,6 +238,13 @@ pub fn Adapter(comptime Engine: type) type {
         slots: usize = 1,
         /// TF_GLM53_POOL (rank 0): the shared cache's ledger; null: each slot keeps a fixed window.
         pool: ?slot_pool.Ledger = null,
+        /// TF_GLM53_FILL_ROWS / _ALONE / _SHARE (request slots): a prompt's pass in pieces of fill_rows while another
+        /// stream decodes (the pass takes fill_share of the time), fill_rows_alone back to back alone; 0: whole.
+        fill_rows: usize = 0,
+        fill_rows_alone: usize = 0,
+        fill_share: f64 = 0.5,
+        fill_next: u64 = 0, // while streams decode, the next piece waits until then (recal.nowNs)
+        filling: [follow.max_lanes]bool = @splat(false), // slot i's stream is still in its prompt pass
         lanes: [follow.max_lanes]Lane = @splat(.{}),
         lane: usize = 0,
         first_tok: ?u32 = null,
@@ -248,7 +257,10 @@ pub fn Adapter(comptime Engine: type) type {
         }
 
         pub fn backend(b: *@This()) be.Backend {
-            return .{ .ptr = b, .vtable = if (b.drafting and !noDraftEnabled()) &drafting_vt else &plain_vt };
+            const drafting = b.drafting and !noDraftEnabled();
+            // TF_GLM53_SLOTS: the prompt pass in pieces (the lane host's fill queue) unless TF_GLM53_FILL_ROWS=0
+            const fills = b.slots > 1 and b.fill_rows != 0;
+            return .{ .ptr = b, .vtable = if (drafting) (if (fills) &drafting_fill_vt else &drafting_vt) else (if (fills) &plain_fill_vt else &plain_vt) };
         }
 
         const plain_vt: be.Backend.VTable = .{ .prefill = prefill, .first = first, .first_masked = firstMasked, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release };
@@ -256,6 +268,18 @@ pub fn Adapter(comptime Engine: type) type {
             var v = plain_vt;
             v.held = heldFn;
             v.probabilities = chancesFn;
+            break :vt v;
+        };
+        const plain_fill_vt: be.Backend.VTable = vt: {
+            var v = plain_vt;
+            v.prefill_step = prefillStep;
+            v.reports_fill = true;
+            break :vt v;
+        };
+        const drafting_fill_vt: be.Backend.VTable = vt: {
+            var v = drafting_vt;
+            v.prefill_step = prefillStep;
+            v.reports_fill = true;
             break :vt v;
         };
 
@@ -575,6 +599,44 @@ pub fn Adapter(comptime Engine: type) type {
 
         fn prefill(ptr: *anyopaque, s: *Stream) anyerror!void {
             const b = self(ptr);
+            try b.prefillOpen(s);
+            _ = try b.prefillRest(s, 0);
+        }
+
+        /// TF_GLM53_SLOTS: one piece of a prompt's pass (the lane host's fill queue calls it between rounds); true once
+        /// the prompt is in. While another stream decodes, pieces are fill_rows long and each is followed by the
+        /// decoding streams' rounds for a while (the pass takes fill_share of the time); alone, fill_rows_alone back
+        /// to back. A stream's first piece runs at once, so a short prompt is in before the next round.
+        fn prefillStep(ptr: *anyopaque, s: *Stream) anyerror!bool {
+            const b = self(ptr);
+            if (b.disk != null or b.fill_rows == 0) {
+                try prefill(ptr, s);
+                return true;
+            }
+            var mine: ?usize = null;
+            var decoding = false;
+            for (0..b.slots) |i| if (b.slotOwner(i)) |o| {
+                if (o == s) mine = i else if (!b.filling[i]) decoding = true;
+            };
+            if (mine) |i| {
+                if (decoding and recal.nowNs() < b.fill_next) return false; // the decoding streams' turn
+                try b.bindLane(i);
+            } else {
+                try b.prefillOpen(s);
+                b.filling[b.lane] = true;
+            }
+            const t0 = recal.nowNs();
+            const done = try b.prefillRest(s, if (decoding) b.fill_rows else b.fill_rows_alone);
+            const t1 = recal.nowNs();
+            b.fill_next = if (decoding) t1 +| fill_plan.waitAfter(t1 -| t0, b.fill_share) else 0;
+            s.fill_at.store(@intCast(@min(b.e.pos, std.math.maxInt(u32))), .monotonic);
+            if (done) b.filling[b.lane] = false;
+            return done;
+        }
+
+        /// The prompt pass up to its prompt rows: the slot, the sampling rule, the reused rows (and the disk path's
+        /// snapshot pieces); prefillRest then prefills the rest of the prompt, whole or in pieces.
+        fn prefillOpen(b: *@This(), s: *Stream) !void {
             try b.bindFreeFor(s.prompt(), s.prompt().len + s.max_new);
             b.first_tok = null;
             b.gpa.free(b.first_mask);
@@ -673,30 +735,35 @@ pub fn Adapter(comptime Engine: type) type {
                         save_base = nextBase(save_base, h, false);
                         from = cut.at;
                     }
-                    try armFirstMask(b, s);
-                    try emit(b, .prefill, from, prompt[from..], @intCast(prompt.len - from));
                     s.cached = @intCast(start);
-                    start = from;
                 } else {
-                    try armFirstMask(b, s);
-                    try emit(b, .prefill, b.e.pos, prompt[reused..], @intCast(prompt.len - reused));
                     s.cached = @intCast(reused);
                 }
             } else {
-                try armFirstMask(b, s);
-                try emit(b, .prefill, b.e.pos, prompt[reused..], @intCast(prompt.len - reused));
                 s.cached = @intCast(reused);
             }
             b.owner = s;
             if (b.resident) {
                 if (comptime @hasField(Engine, "last_reused")) b.e.last_reused = reused;
             }
-            // A warm pass takes this same exact prefill. It has no chunk gate here, so it cannot step aside mid-pass;
-            // it only prefills rows the next turn needs, and lane_host's quiet wait keeps it from starting beside work.
-            if (start < prompt.len) {
-                const t = try b.e.prefill(prompt[start..]);
-                if (b.slots > 1) b.first_tok = t;
-            }
+        }
+
+        /// The prompt's next piece from the engine's position (the rest when `rows` is 0), its rows to the followers
+        /// first; true once the prompt is in (the first mask armed before the last piece, its first token kept). Pieces
+        /// end on multiples of `rows`, whole chunks of the engine's absolute grid: the same chunks as one pass. A warm
+        /// pass takes this same exact prefill whole; it only prefills rows the next turn needs, and lane_host's quiet
+        /// wait keeps it from starting beside work.
+        fn prefillRest(b: *@This(), s: *Stream, rows: usize) !bool {
+            const prompt = s.prompt();
+            const pos = b.e.pos;
+            if (pos >= prompt.len) return true;
+            const end = fill_plan.pieceEnd(pos, prompt.len, rows);
+            const last = end == prompt.len;
+            if (last) try armFirstMask(b, s);
+            try emit(b, .prefill, pos, prompt[pos..end], @intCast(end - pos));
+            const t = try b.e.prefill(prompt[pos..end]);
+            if (last and b.slots > 1) b.first_tok = t;
+            return last;
         }
 
         fn lastHeader(b: *@This()) follow.Header {
@@ -1030,6 +1097,7 @@ pub fn Adapter(comptime Engine: type) type {
             const b = self(ptr);
             b.bindStream(s) catch return;
             if (b.owner == s) {
+                b.filling[b.lane] = false;
                 // TF_GLM53_CAPTURE_DIR: the transcript goes out before any rollback below drops it.
                 if (comptime @hasDecl(Engine, "captureEnd")) b.e.captureEnd();
                 b.gpa.free(b.first_mask);
