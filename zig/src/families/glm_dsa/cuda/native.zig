@@ -16,6 +16,7 @@ const state = @import("state");
 const uma = @import("uma");
 const glm_config = @import("glm_config");
 const backend_adapter = @import("backend");
+const slot_pool = backend_adapter.slot_pool;
 const manifest_mod = weights.manifest;
 const follow = @import("glm_follow");
 const prewarm = @import("prewarm");
@@ -930,7 +931,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     // rows, the sentinel rows inside its slot), so everything below sizes for N * (context + 2) - 2 positions.
     // TF_GLM53_SLOT_SIZES=a,b,..: slots of those windows instead (--context is the largest), sum(size + 2) - 2.
     const plan = slotPlan(o.context) catch |err| {
-        std.log.err("GLM-5.3 native open failed: TF_GLM53_SLOTS must be 1..{d}; TF_GLM53_SLOT_SIZES needs 2..{d} windows of at least 2048, the largest equal to --context", .{ follow.max_lanes, follow.max_lanes });
+        std.log.err("GLM-5.3 native open failed: TF_GLM53_SLOTS must be 1..{d}; TF_GLM53_SLOT_SIZES needs 2..{d} windows of at least 2048, the largest equal to --context; TF_GLM53_POOL needs TF_GLM53_SLOTS >= 2, no TF_GLM53_SLOT_SIZES, and at least --context + {d} positions ({s})", .{ follow.max_lanes, follow.max_lanes, slot_pool.margin, @errorName(err) });
         return err;
     };
     var whole = o;
@@ -1494,12 +1495,19 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
         errdefer gpa.free(views);
         var row0: usize = 0;
         for (views, 0..) |*v, i| {
+            if (slot_plan.pool != 0) {
+                // TF_GLM53_POOL: a slot holds no rows until rank 0's ledger claims some (a claim frame on every
+                // rank); until then its view is a placeholder no stream runs on.
+                v.* = try own.st.slotViewRows(0, slot_pool.min_positions + 2);
+                continue;
+            }
             v.* = try own.st.slotViewRows(row0, slot_plan.sizes[i] + 2);
             row0 += slot_plan.sizes[i] + 2;
         }
         const seqs = try gpa.alloc(engine_mod.Seq, request_slots);
         for (seqs, 0..) |*q, i| q.* = .{ .drafter = if (slot_drafting) laneDrafter(own.engine.drafter.?, &own.slot_lanes[i]) else null };
         own.engine.views = views;
+        if (slot_plan.pool != 0) own.engine.root = &own.st;
         own.engine.seqs = seqs;
         own.engine.bound = 0;
         own.engine.f.st = &own.engine.views[0];
@@ -1507,7 +1515,14 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
         own.adapter.drafting = slot_drafting;
         own.adapter.solo_drafts = slot_drafting and slot_drafts == .solo;
         own.adapter.slots = request_slots;
-        if (p.rank == 0) for (views, 0..) |v, i| std.log.info("TF_GLM53_SLOTS: slot {d} holds {d} positions", .{ i, v.capacity });
+        if (slot_plan.pool != 0) {
+            var ledger = try slot_pool.Ledger.init(own.st.slots, request_slots);
+            ledger.big = slot_plan.pool_big;
+            ledger.evict = slot_plan.pool_evict;
+            ledger.wait_reuse = slot_plan.pool_wait;
+            own.adapter.pool = ledger;
+            if (p.rank == 0) std.log.info("TF_GLM53_POOL: {d} request slots share {d} positions ({d} rows); a request claims its prompt + reply + {d} (at most --context {d}); claims of {d}+ rows from the bottom, smaller from the top; idle kept rows give way {s} first; a kept prefix of {d}+ rows waits to grow in place", .{ request_slots, slot_plan.pool, own.st.slots, slot_pool.margin, slot_plan.sizes[0], ledger.big, if (ledger.evict == .small) "smallest" else "oldest", ledger.wait_reuse });
+        } else if (p.rank == 0) for (views, 0..) |v, i| std.log.info("TF_GLM53_SLOTS: slot {d} holds {d} positions", .{ i, v.capacity });
         if (p.rank == 0) std.log.info("TF_GLM53_SLOTS={d}: {d} request slots of {d} positions on one cache; drafts {s}, resident reuse {s}, shared windows eager", .{ request_slots, request_slots, views[0].capacity, if (!slot_drafting) "off" else if (slot_drafts == .solo) "solo (a stream alone drafts; shared rounds feed each slot's ring)" else "all (the cost rule drafts shared rounds too)", if (resident) "per slot (a prompt takes the free slot with the longest kept prefix)" else "off" });
     }
     own.adapter.draft_chances = own.alive_host and draftChancesSwitch();
@@ -1711,6 +1726,11 @@ const SlotPlan = struct {
     sizes: [follow.max_lanes]usize = @splat(0),
     whole: usize = 0,
     sized: bool = false, // the windows differ: admission checks which slot a request fits
+    /// TF_GLM53_POOL: the shared cache's positions (0: fixed windows); the slots claim rows of it as requests need.
+    pool: usize = 0,
+    pool_big: usize = 32768, // TF_GLM53_POOL_BIG: claims of at least this many rows go to the bottom
+    pool_evict: slot_pool.Evict = .small, // TF_GLM53_POOL_EVICT: small (fewest kept rows) or old (least recent)
+    pool_wait: usize = 32768, // TF_GLM53_POOL_WAIT: a kept prefix this long waits to grow in place
 
     fn widest(p: SlotPlan) usize {
         var w: usize = 0;
@@ -1721,6 +1741,21 @@ const SlotPlan = struct {
 
 fn slotPlan(context: usize) !SlotPlan {
     var p: SlotPlan = .{};
+    // TF_GLM53_POOL=P (with TF_GLM53_SLOTS=N): N slots share one cache of P positions; --context bounds a request.
+    if (std.c.getenv("TF_GLM53_POOL")) |raw| {
+        if (std.c.getenv("TF_GLM53_SLOT_SIZES") != null) return error.PoolWithSlotSizes;
+        p.count = try slotsEnv();
+        if (p.count < 2) return error.PoolNeedsSlots;
+        p.pool = std.fmt.parseInt(usize, std.mem.trim(u8, std.mem.span(raw), " "), 10) catch return error.BadPool;
+        if (p.pool < context + slot_pool.margin) return error.PoolBelowContext;
+        if (std.c.getenv("TF_GLM53_POOL_BIG")) |v| p.pool_big = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return error.BadPool;
+        if (std.c.getenv("TF_GLM53_POOL_WAIT")) |v| p.pool_wait = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return error.BadPool;
+        if (std.c.getenv("TF_GLM53_POOL_EVICT")) |v| p.pool_evict = std.meta.stringToEnum(slot_pool.Evict, std.mem.span(v)) orelse return error.BadPool;
+        for (p.sizes[0..p.count]) |*n| n.* = context;
+        p.whole = p.pool;
+        p.sized = true;
+        return p;
+    }
     if (std.c.getenv("TF_GLM53_SLOT_SIZES")) |raw| {
         p.count = 0;
         var it = std.mem.splitScalar(u8, std.mem.span(raw), ',');

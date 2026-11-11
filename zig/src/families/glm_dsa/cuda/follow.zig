@@ -7,7 +7,7 @@ const std = @import("std");
 const cuda = @import("cuda");
 pub const max_decode_rows = 16;
 
-pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draw, end, release, cache_hit, rollback, prefill_rows, draft_block, park, unpark, snap_save, snap_load, snap_commit, prewarm_graph, masks = 18, verify_shared = 19, absorb = 20 };
+pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draw, end, release, cache_hit, rollback, prefill_rows, draft_block, park, unpark, snap_save, snap_load, snap_commit, prewarm_graph, masks = 18, verify_shared = 19, absorb = 20, claim = 21 };
 
 /// TF_GLM53_SLOTS: request slots a follower binds at most (engine.max_shared). A frame names its slot in the high
 /// half of `protocol` (slot 0: protocol 1, the single-stream wire as before).
@@ -24,7 +24,7 @@ pub fn laneOf(h: Header) usize {
 }
 
 pub fn hasPayload(kind: u32) bool {
-    return kind == @backingInt(Kind.begin) or kind == @backingInt(Kind.prefill) or kind == @backingInt(Kind.verify) or kind == @backingInt(Kind.cache_hit) or kind == @backingInt(Kind.prefill_rows) or kind == @backingInt(Kind.draft_block) or kind == @backingInt(Kind.park) or kind == @backingInt(Kind.unpark) or kind == @backingInt(Kind.snap_load) or kind == @backingInt(Kind.prewarm_graph) or kind == @backingInt(Kind.masks) or kind == @backingInt(Kind.verify_shared) or kind == @backingInt(Kind.absorb);
+    return kind == @backingInt(Kind.begin) or kind == @backingInt(Kind.prefill) or kind == @backingInt(Kind.verify) or kind == @backingInt(Kind.cache_hit) or kind == @backingInt(Kind.prefill_rows) or kind == @backingInt(Kind.draft_block) or kind == @backingInt(Kind.park) or kind == @backingInt(Kind.unpark) or kind == @backingInt(Kind.snap_load) or kind == @backingInt(Kind.prewarm_graph) or kind == @backingInt(Kind.masks) or kind == @backingInt(Kind.verify_shared) or kind == @backingInt(Kind.absorb) or kind == @backingInt(Kind.claim);
 }
 
 
@@ -46,7 +46,7 @@ pub const Link = struct {
     pub fn validate(h: Header, ids: []const u32) !void {
         if (h.protocol & 0xffff != 1) return error.ProtocolMismatch;
         if (laneOf(h) >= max_lanes) return error.BadPayload;
-        if (h.kind < @backingInt(Kind.begin) or h.kind > @backingInt(Kind.absorb)) return error.BadKind;
+        if (h.kind < @backingInt(Kind.begin) or h.kind > @backingInt(Kind.claim)) return error.BadKind;
         const payload_kind = hasPayload(h.kind);
 
         if (h.kind == @backingInt(Kind.begin) and h.slot > 1) return error.BadPayload;
@@ -58,6 +58,8 @@ pub const Link = struct {
         if (h.kind == @backingInt(Kind.draft_block) and (ids.len != 2 or ids[0] > max_decode_rows)) return error.BadPayload;
         // TF_GLM53_SLOTS: [n], the kept rows a round that holds no drafts takes into the slot's drafter context.
         if (h.kind == @backingInt(Kind.absorb) and (ids.len != 1 or ids[0] > max_decode_rows)) return error.BadPayload;
+        // TF_GLM53_POOL: [start, rows], the slot's rows in the shared cache (rows 0: none; else a view's minimum).
+        if (h.kind == @backingInt(Kind.claim) and (ids.len != 2 or (ids[1] != 0 and ids[1] < 2048 + 2))) return error.BadPayload;
 
         if (h.kind == @backingInt(Kind.park) and (ids.len != 2 or ids[0] % 512 != 0 or ids[0] >= ids[1] or ids[1] - ids[0] > 1 << 20)) return error.BadPayload;
         if (h.kind == @backingInt(Kind.unpark) and ids.len != 1) return error.BadPayload;
@@ -155,6 +157,13 @@ pub const Link = struct {
             .absorb => {
                 if (comptime @hasDecl(@TypeOf(engine.*), "absorbBlock"))
                     try engine.absorbBlock(@intCast(h.position), @intCast(ids[0]))
+                else
+                    return error.UnsupportedOperation;
+            },
+            .claim => {
+                // TF_GLM53_POOL: rank 0's ledger gave this slot rows [start, start + rows) of the shared cache.
+                if (comptime @hasDecl(@TypeOf(engine.*), "claimSlot"))
+                    try engine.claimSlot(laneOf(h), ids[0], ids[1])
                 else
                     return error.UnsupportedOperation;
             },
@@ -308,9 +317,15 @@ test "park protocol frames validate payloads and preserve the payload kind map" 
     try std.testing.expectError(error.BadPayload, Link.validate(.{ .kind = park_kind, .n = 2 }, &.{ 1, 512 }));
     try std.testing.expectError(error.BadPayload, Link.validate(.{ .kind = park_kind, .n = 2 }, &.{ 1024, 1024 }));
     try std.testing.expectError(error.BadPayload, Link.validate(.{ .kind = unpark_kind, .n = 1 }, &.{}));
-    // 17 = prewarm_graph, 18 = masks, 19 = verify_shared and 20 = absorb; 21 is past the last kind.
-    try std.testing.expectError(error.BadKind, Link.validate(.{ .kind = 21 }, &.{}));
-    for (1..21) |k| try std.testing.expectEqual(k == 1 or k == 2 or k == 3 or k == 8 or k == 10 or k == 11 or k == 12 or k == 13 or k == 15 or k == 17 or k == 18 or k == 19 or k == 20, hasPayload(@intCast(k)));
+    // 17 = prewarm_graph, 18 = masks, 19 = verify_shared, 20 = absorb and 21 = claim; 22 is past the last kind.
+    try std.testing.expectError(error.BadKind, Link.validate(.{ .kind = 22 }, &.{}));
+    for (1..22) |k| try std.testing.expectEqual(k == 1 or k == 2 or k == 3 or k == 8 or k == 10 or k == 11 or k == 12 or k == 13 or k == 15 or k == 17 or k == 18 or k == 19 or k == 20 or k == 21, hasPayload(@intCast(k)));
+    // TF_GLM53_POOL claims: [start, rows], rows 0 (released) or at least a view's minimum
+    const claim_kind = @backingInt(Kind.claim);
+    try Link.validate(.{ .kind = claim_kind, .n = 2 }, &.{ 4096, 0 });
+    try Link.validate(.{ .kind = claim_kind, .n = 2 }, &.{ 0, 2050 });
+    try std.testing.expectError(error.BadPayload, Link.validate(.{ .kind = claim_kind, .n = 2 }, &.{ 0, 2049 }));
+    try std.testing.expectError(error.BadPayload, Link.validate(.{ .kind = claim_kind, .n = 1 }, &.{0}));
 }
 
 test "park protocol apply checks position and the follower restored frontier" {
@@ -353,7 +368,7 @@ test "follower masks frames validate, arm and clear" {
     try std.testing.expectError(error.BadPayload, Link.validate(.{ .kind = kind, .n = 17, .slot = 17 }, &too_many));
     try std.testing.expectError(error.BadPayload, Link.validate(.{ .kind = kind, .n = 3, .slot = 2 }, &.{ 1, 2, 3 }));
     try std.testing.expectError(error.BadPayload, Link.validate(.{ .kind = kind, .n = 0, .slot = 1 }, &.{}));
-    try std.testing.expectError(error.BadKind, Link.validate(.{ .kind = 21 }, &.{}));
+    try std.testing.expectError(error.BadKind, Link.validate(.{ .kind = 22 }, &.{}));
     const Fake = struct {
         pos: usize = 0,
         seed: u64 = 0,

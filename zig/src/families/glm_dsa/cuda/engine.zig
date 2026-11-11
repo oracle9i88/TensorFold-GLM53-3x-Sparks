@@ -240,6 +240,8 @@ pub const Engine = struct {
     views: []state.State = &.{},
     seqs: []Seq = &.{},
     bound: usize = 0,
+    /// TF_GLM53_POOL: the whole cache the slots' views lie in; a claim frame moves or grows a slot's view in it.
+    root: ?*const state.State = null,
     /// TF_GLM53_CAPTURE_DIR (rank 0, attached once serving starts): drafter training rows per request. Null: off.
     capture: ?*capture_mod.Capture = null,
     /// Drafter drafts in the next verify window (the adapter sets it; copy proposals count 0), for the capture.
@@ -455,6 +457,18 @@ pub const Engine = struct {
         e.load(&e.seqs[slot]);
         e.f.st = &e.views[slot];
         e.bound = slot;
+    }
+
+    /// TF_GLM53_POOL: slot `slot` takes rows [start, start + rows) of the shared cache (rows 0: it holds none; its
+    /// view stays as it was, unused until the next claim). Rank 0's ledger planned it: a grown view starts where it
+    /// did (its kept rows stay), a moved one holds nothing yet (the planner rolled its slot back to 0 first). A
+    /// decode graph bakes its view's rows, so the graph fingerprint carries them and a moved view captures anew.
+    pub fn claimSlot(e: *Engine, slot: usize, start: usize, rows: usize) !void {
+        if (slot >= e.views.len) return error.UnknownSlot;
+        const root = e.root orelse return error.NoPool;
+        if (rows == 0) return;
+        e.views[slot] = try root.slotViewRows(start, rows);
+        if (e.pos > e.views[slot].capacity and slot == e.bound) return error.ClaimBelowPosition;
     }
 
     fn stash(e: *const Engine, q: *Seq) void {
@@ -1177,7 +1191,8 @@ pub const Engine = struct {
                 .candidates => |c| c,
                 else => 0,
             };
-            const print = cuda.graph_cache.fingerprintOf(&.{ @intFromPtr(f.st), @intFromPtr(f.w), @intFromPtr(f.k), @intFromPtr(f.coll.ctx), @backingInt(std.meta.activeTag(f.head)), k, @intFromPtr(f.mk), if (f.taps) |t| t.out else 0 });
+            // TF_GLM53_POOL: a slot's view can move inside the one cache, so its planes' rows are part of the print.
+            const print = cuda.graph_cache.fingerprintOf(&.{ @intFromPtr(f.st), @intFromPtr(f.w), @intFromPtr(f.k), @intFromPtr(f.coll.ctx), @backingInt(std.meta.activeTag(f.head)), k, @intFromPtr(f.mk), if (f.taps) |t| t.out else 0, f.st.latent.ptr, f.st.rope.ptr, f.st.index_keys.ptr });
             // MK8: a capture cannot upload a megakernel plan (no allocation or sync copy while capturing), so a
             // key's first window runs once eagerly to build its plans; the window is idempotent (same rows, same
             // KV writes, the head is read after the replay).

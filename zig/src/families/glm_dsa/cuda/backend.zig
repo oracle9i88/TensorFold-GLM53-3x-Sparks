@@ -21,6 +21,8 @@ const Stream = lanes.Stream;
 const follow = @import("glm_follow");
 const prefix_cache = @import("prefix_cache");
 pub const recal = @import("recal.zig");
+/// TF_GLM53_POOL: request slots claiming rows of one shared cache (the ledger and its planner).
+pub const slot_pool = @import("slot_pool.zig");
 test { _ = recal; }
 
 pub const DiskHit = struct { at: usize, key: u64, files: usize = 1 };
@@ -232,6 +234,8 @@ pub fn Adapter(comptime Engine: type) type {
         /// lane fields while another is bound, the bound slot, and the bound slot's first token kept from its prefill
         /// (another stream's forward may overwrite the head rows before `first` reads them).
         slots: usize = 1,
+        /// TF_GLM53_POOL (rank 0): the shared cache's ledger; null: each slot keeps a fixed window.
+        pool: ?slot_pool.Ledger = null,
         lanes: [follow.max_lanes]Lane = @splat(.{}),
         lane: usize = 0,
         first_tok: ?u32 = null,
@@ -463,6 +467,7 @@ pub fn Adapter(comptime Engine: type) type {
         /// lane host queues the request again), ContextFull when none could.
         fn bindFreeFor(b: *@This(), prompt: []const u32, need: usize) !void {
             if (b.slots == 1) return;
+            if (b.pool != null) return b.bindPooled(prompt, need);
             const reuse_on = comptime @hasDecl(Engine, "reusableOn");
             var best: ?usize = null;
             var best_reuse: usize = 0;
@@ -486,6 +491,62 @@ pub fn Adapter(comptime Engine: type) type {
             return if (need <= widest) error.LaneMemory else error.ContextFull;
         }
 
+        /// TF_GLM53_POOL: what the planner sees of every slot (reuse only with a prompt and resident reuse on).
+        fn poolSlots(b: *@This(), prompt: ?[]const u32, out: *[slot_pool.max_slots]slot_pool.Slot) []const slot_pool.Slot {
+            for (0..b.slots) |i| {
+                const kept = if (comptime @hasDecl(Engine, "frontierOn")) b.e.frontierOn(i) else 0;
+                var reuse: usize = 0;
+                if (comptime @hasDecl(Engine, "reusableOn")) if (prompt) |ids| if (b.resident) {
+                    reuse = b.e.reusableOn(i, ids);
+                };
+                out[i] = .{ .busy = b.slotOwner(i) != null, .kept = kept, .reuse = reuse };
+            }
+            return out[0..b.slots];
+        }
+
+        /// TF_GLM53_POOL: bind a slot for a prompt of `need` positions (prompt + reply): the ledger's plan carried out
+        /// on every rank. Slots that give way roll back to 0 (their kept rows go), a grown slot keeps its rows, a
+        /// moved one rolls back to 0 and takes its new rows (a claim frame each, so the followers' views match).
+        fn bindPooled(b: *@This(), prompt: []const u32, need: usize) !void {
+            const l = &b.pool.?;
+            var info: [slot_pool.max_slots]slot_pool.Slot = undefined;
+            const slots = b.poolSlots(prompt, &info);
+            const p = l.plan(slots, need) catch |err| {
+                if (err == error.LaneMemory) std.log.info("TF_GLM53_POOL: {d} positions wait for room", .{need});
+                return err;
+            };
+            for (0..b.slots) |j| if (p.evict[j]) {
+                try b.bindLane(j);
+                std.log.info("TF_GLM53_POOL: slot {d} gives way ({d} kept rows dropped, rows [{d}, {d}) freed)", .{ j, slots[j].kept, l.start[j], l.start[j] + l.rows[j] });
+                try b.poolDrop();
+            };
+            try b.bindLane(p.slot);
+            switch (p.action) {
+                .keep => {},
+                .extend => try b.poolClaim(p.start, p.rows),
+                .claim => {
+                    try b.poolDrop();
+                    try b.poolClaim(p.start, p.rows);
+                },
+            }
+            l.apply(p);
+            std.log.info("TF_GLM53_POOL: slot {d} {s} rows [{d}, {d}) for {d} positions, reuse {d}", .{ p.slot, @tagName(p.action), p.start, p.start + p.rows, need, slots[p.slot].reuse });
+        }
+
+        /// TF_GLM53_POOL: the bound slot's kept rows dropped on every rank (a rollback to 0).
+        fn poolDrop(b: *@This()) !void {
+            if (b.e.pos == 0) return;
+            try emit(b, .rollback, b.e.pos, &.{}, 0);
+            if (comptime @hasDecl(Engine, "rollback")) try b.e.rollback(0);
+        }
+
+        /// TF_GLM53_POOL: the bound slot's view becomes rows [start, start + rows) on every rank.
+        fn poolClaim(b: *@This(), start: usize, rows: usize) !void {
+            const ids = [_]u32{ @intCast(start), @intCast(rows) };
+            try emit(b, .claim, b.e.pos, &ids, 2);
+            if (comptime @hasDecl(Engine, "claimSlot")) try b.e.claimSlot(b.lane, start, rows) else return error.UnsupportedOperation;
+        }
+
         /// A slot's window: its cache view's capacity (no views: the one cache's).
         fn slotCapacity(b: *const @This(), i: usize) usize {
             if (comptime @hasField(Engine, "views")) {
@@ -500,6 +561,12 @@ pub fn Adapter(comptime Engine: type) type {
             const b = self(ptr);
             if (b.slots == 1) return true;
             const need = @as(usize, prompt) + max_new;
+            // TF_GLM53_POOL: a free slot and room for the claim now, idle kept prefixes giving way if they must
+            if (b.pool) |*l| {
+                var info: [slot_pool.max_slots]slot_pool.Slot = undefined;
+                _ = l.plan(b.poolSlots(null, &info), need) catch return false;
+                return true;
+            }
             for (0..b.slots) |i| {
                 if (b.slotOwner(i) == null and need <= b.slotCapacity(i)) return true;
             }
@@ -994,6 +1061,8 @@ pub fn Adapter(comptime Engine: type) type {
                 if (!b.resident) {
                     if (comptime @hasDecl(Engine, "rollback")) b.e.rollback(0) catch {};
                     if (comptime @hasField(Engine, "ablate_on")) b.e.ablate_on = false;
+                    // TF_GLM53_POOL: nothing kept, so the slot's rows go back to the pool (no frame: only rank 0 plans)
+                    if (b.pool) |*l| l.release(b.lane);
                 }
                 if (comptime @hasDecl(Engine, "requestEnd")) b.e.requestEnd() catch {};
             }
