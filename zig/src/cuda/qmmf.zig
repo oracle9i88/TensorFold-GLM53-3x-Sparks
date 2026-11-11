@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
+// Modified 2026 in the glm53-tp3-3x-sparks branch (GLM-5.3 on three DGX Sparks); see docs/tp3-changes.txt.
 //! The lane matmul (qmmf.cu) for FP4, FP8, MXFP8, FP8G, FP8B and BF16 weights, with its kernel, tile and slices.
 const std = @import("std");
 const driver = @import("driver.zig");

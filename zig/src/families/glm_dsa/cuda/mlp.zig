@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Kristian Aaron (Krishando)
+// Modified 2026 in the glm53-tp3-3x-sparks branch (GLM-5.3 on three DGX Sparks); see docs/tp3-changes.txt.
 // Adapted from bertholomus/TensorFold@ddfad35:src/tensorfold/families/glm_moe_dsa/cuda/forward.py (Apache-2.0). Changes: Zig FP8B launch path and host reference for TP2 dense MLP slices.
 //! GLM-5.3 DSA shared expert and dense MLP on the FP8B linear path (WP8).
 const std = @import("std");

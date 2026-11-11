@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Kristian Aaron (Krishando)
+// Modified 2026 in the glm53-tp3-3x-sparks branch (GLM-5.3 on three DGX Sparks); see docs/tp3-changes.txt.
 //! GLM-5.3 fp32 candidate sampling and rank-local logsumexp merging (K9).
 //! Adapted from ashhart/TensorFold@d1018b31:zig/kernels/cuda/sample.cu (Apache-2.0).
 //! Sampling order and keyed doubles follow bertholomus/bertholomus/TensorFold@ddfad35:src/tensorfold/engine/exact_sampling.py and glm5_next/cuda/decode.py (Apache-2.0).

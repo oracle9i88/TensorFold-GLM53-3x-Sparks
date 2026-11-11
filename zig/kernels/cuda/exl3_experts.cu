@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
+// Modified 2026 in the glm53-tp3-3x-sparks branch (GLM-5.3 on three DGX Sparks); see docs/tp3-changes.txt.
 #include "tf_vblock.cuh"
 // EXL3 routed experts: grouping, grouped GEMMs, epilogues; port of tensorfold's experts.cu (ExLlamaV3, Turboderp).
 // Adapted from bertholomus/TensorFold@ddfad35:src/tensorfold/cuda/exl3/ (Apache-2.0). Changes: add the CB 3 grouped instantiation.

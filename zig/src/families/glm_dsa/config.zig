@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
+// Modified 2026 in the glm53-tp3-3x-sparks branch (GLM-5.3 on three DGX Sparks); see docs/tp3-changes.txt.
 //! GLM-5.3's shape (model_type glm_moe_dsa) from config.json, and one Mac's share of it under tensor parallelism.
 const std = @import("std");
 

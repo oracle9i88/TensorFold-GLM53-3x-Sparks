@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 the glm53-tp3-3x-sparks contributors
 //! GLM-5.3 drafter training capture (TF_GLM53_CAPTURE_DIR, rank 0 only): one file per request with the rows a
 //! drafter trains on, read from buffers the serving path already fills (no extra kernels, outputs unchanged).
 //! - prompt block: the drafter tap rows of the prompt's last `window` positions (what the drafter's ring holds);

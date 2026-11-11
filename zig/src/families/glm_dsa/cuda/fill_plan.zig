@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 the glm53-tp3-3x-sparks contributors
 //! TF_GLM53_FILL_*: with request slots, a prompt's pass runs in pieces between the other streams' rounds (the lane
 //! host's fill queue), so a long prompt no longer stops every reply for its whole pass. Pieces end on multiples of the
 //! piece rows, a multiple of the engine's chunk rows: the engine cuts its chunks from absolute positions, so the pieces

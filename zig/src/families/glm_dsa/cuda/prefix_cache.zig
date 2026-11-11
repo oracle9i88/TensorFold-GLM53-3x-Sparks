@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Kristian Aaron (Krishando)
+// Modified 2026 in the glm53-tp3-3x-sparks branch (GLM-5.3 on three DGX Sparks); see docs/tp3-changes.txt.
 //! Host-side saved-prefix index and deterministic cut policy for GLM-5.3.
 //! Index/sweep design follows MiaAI-Lab patch 0132 (Apache-2.0, Copyright 2026 Mia's AI Lab);
 //! file format follows ashhart/TensorFold sessions/format.zig (Apache-2.0).

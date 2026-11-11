@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Kristian Aaron (Krishando)
+// Modified 2026 in the glm53-tp3-3x-sparks branch (GLM-5.3 on three DGX Sparks); see docs/tp3-changes.txt.
 //! DCP candidate merge follows ashhart/TensorFold PR #159 by drowzeys (Apache-2.0).
 //! Host references and DCP2 layouts adapt bertholomus/bertholomus/TensorFold@ddfad35 `select.py` and `dcp.py` (Apache-2.0).
 //! The radix kernel is ported from the zig blob f633f78e223d at ashhart/TensorFold@d1018b31.

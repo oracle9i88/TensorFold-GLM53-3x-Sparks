@@ -20,3 +20,11 @@ Parts of this fork follow MiaAI-Lab's GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold, whi
   Copyright 2026 Mia's AI Lab (MiaAI-Lab)
 
 Third-party code and its licenses are listed in THIRD_PARTY_NOTICES.md.
+
+Branch glm53-tp3-3x-sparks: GLM-5.3 on three DGX Sparks (TP3), on top of this fork's commit
+a73f5fd4870f93b709a8a6180357e52192374511. Not affiliated with or endorsed by the TensorFold project or by
+Kristian Aaron. Changes: Copyright 2026 the glm53-tp3-3x-sparks contributors. Apache License, Version 2.0.
+The files this branch added or changed are listed in docs/tp3-changes.txt; each changed file says so in its header.
+The first TP3 draft came from an Antigravity agent session; the shared KV pool's semantics (claims by actual need,
+first-fit holes, idle kept prefixes giving way) follow ciprianveg/gb10-tensorfold (branch glm53-nvfp4-csf, where they
+are credited to Mia's design); no code was copied from it.

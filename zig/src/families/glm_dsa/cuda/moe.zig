@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Kristian Aaron (Krishando)
+// Modified 2026 in the glm53-tp3-3x-sparks branch (GLM-5.3 on three DGX Sparks); see docs/tp3-changes.txt.
 //! GLM-5.3 DSA router, slot contracts, and rank-local low-rank correction (WP8).
 const std = @import("std");
 const cuda = @import("cuda");

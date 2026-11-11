@@ -1,5 +1,9 @@
 # TensorFold
 
+> **Branch `glm53-tp3-3x-sparks`:** the GLM-5.3 family of this fork running on **three** DGX Sparks (TP3), with up to
+> three concurrent requests drawing on one shared KV pool and long prompts read in pieces between the other replies'
+> rounds. What changed, how to run it and what it measured: [docs/glm53-tp3.md](docs/glm53-tp3.md).
+
 > This is an independent fork of TensorFold for GLM-5.3 on two DGX Sparks. It is not affiliated with or endorsed by
 > the TensorFold project. See `NOTICE` and `THIRD_PARTY_NOTICES.md` for credits.
 

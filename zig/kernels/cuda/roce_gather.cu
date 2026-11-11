@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
+// Modified 2026 in the glm53-tp3-3x-sparks branch (GLM-5.3 on three DGX Sparks); see docs/tp3-changes.txt.
 // Two-rank one-shot RoCE all-gather and rank-order all-reduce after
 // flashinfer/experimental/b12x/comm/roce/_oneshot_cute.py (local-inference-lab/flashinfer@4092b28, Apache-2.0).
 // Also see docs/roce-gather.md for this implementation's constraints.

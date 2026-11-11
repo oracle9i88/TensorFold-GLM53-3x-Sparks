@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Kristian Aaron (Krishando)
+// Modified 2026 in the glm53-tp3-3x-sparks branch (GLM-5.3 on three DGX Sparks); see docs/tp3-changes.txt.
 //! GLM-5.3 CUDA weights for one TP2 rank (WP9): the FP8 backbone on qmmf `.fp8b` with its native 128x128 scales,
 //! kv_b once in checkpoint form (absorb and expand-V both read it), EXL3 routed experts through WP4's loader.
 //! Loader shape adapted from ashhart/TensorFold@d1018b31:zig/src/families/glm/cuda_weights.zig (Apache-2.0).

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 the glm53-tp3-3x-sparks contributors
 //! TF_GLM53_POOL: request slots on one shared cache, each claiming the rows its request needs instead of a fixed
 //! window. The semantics (a claim of what the request needs, first-fit holes, idle kept prefixes give way, honest
 //! waiting when nothing fits) follow the shared KV pool of ciprianveg/gb10-tensorfold (branch glm53-nvfp4-csf, credited

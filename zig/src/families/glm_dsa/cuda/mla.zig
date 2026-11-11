@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Kristian Aaron (Krishando)
+// Modified 2026 in the glm53-tp3-3x-sparks branch (GLM-5.3 on three DGX Sparks); see docs/tp3-changes.txt.
 // Adapted from bertholomus/bertholomus/TensorFold@ddfad35:src/tensorfold/families/glm_moe_dsa/cuda/mla_pe.py (Apache-2.0).
 // DCP coordination follows bertholomus/bertholomus/TensorFold@ddfad35:src/tensorfold/families/glm_moe_dsa/cuda/dcp.py and ashhart/TensorFold PR #159 by drowzeys (Apache-2.0).
 // Changes: Zig host references and CUDA launch plans for full GLM-5.3 MLA, including native FP8 kv_b access.

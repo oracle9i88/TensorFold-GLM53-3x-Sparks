@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Kristian Aaron (Krishando)
+// Modified 2026 in the glm53-tp3-3x-sparks branch (GLM-5.3 on three DGX Sparks); see docs/tp3-changes.txt.
 //! GLM-5.3 CUDA forward for one TP2 + DCP2 rank (WP9): decode windows (`Forward.whole`) and prefill chunks
 //! (`Forward.pieced`) through the real launch wrappers of WP2 (qmmf `.fp8b`), WP4 (EXL3 experts), WP6 (MLA),
 //! WP7 (indexer), WP8 (MoE/MLP/low-rank/glue) and WP10 (fp32 head).

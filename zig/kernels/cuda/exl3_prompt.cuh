@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
+// Modified 2026 in the glm53-tp3-3x-sparks branch (GLM-5.3 on three DGX Sparks); see docs/tp3-changes.txt.
 // Common EXL3 prompt helpers, after @BobClawblaw (#976) and MiaAI-Lab (Apache-2.0, patches 0004 and 0009).
 #pragma once
 #include "tf_vblock.cuh"

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Kristian Aaron (Krishando)
+// Modified 2026 in the glm53-tp3-3x-sparks branch (GLM-5.3 on three DGX Sparks); see docs/tp3-changes.txt.
 // Adapted from ashhart/TensorFold@d1018b31: zig/src/families/glm/cuda_native.zig (Apache-2.0). Changes: adds the glm_moe_dsa native contract and WP9 seam.
 //! Native CUDA registration surface for the full GLM-5.3 DSA family.
 

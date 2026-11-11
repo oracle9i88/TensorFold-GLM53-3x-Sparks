@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Kristian Aaron (Krishando)
+// Modified 2026 in the glm53-tp3-3x-sparks branch (GLM-5.3 on three DGX Sparks); see docs/tp3-changes.txt.
 //! GLM-5.3 CUDA engine for one TP2 rank (WP9): prefill, verify, keep and draw over Forward, WP10's sampler, and
 //! keyed CUDA graphs (cuda.graph_cache) for decode windows. Shape after ashhart/TensorFold@d1018b31:
 //! zig/src/families/glm/cuda_engine.zig (Apache-2.0); greedy ties and candidate sampling follow

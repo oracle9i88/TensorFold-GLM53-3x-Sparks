@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Kristian Aaron (Krishando)
+// Modified 2026 in the glm53-tp3-3x-sparks branch (GLM-5.3 on three DGX Sparks); see docs/tp3-changes.txt.
 // Adapted from bertholomus/TensorFold@ddfad35:src/tensorfold/families/glm_moe_dsa/cuda/weights.py (Apache-2.0). Changes: Zig checkpoint upload and TP2 slices.
 //! GLM-5.3 routed EXL3 experts, loaded as TP intermediate halves and run by the shared grouped expert kernels.
 const std = @import("std");

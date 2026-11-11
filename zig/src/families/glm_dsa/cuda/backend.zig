@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Kristian Aaron (Krishando)
+// Modified 2026 in the glm53-tp3-3x-sparks branch (GLM-5.3 on three DGX Sparks); see docs/tp3-changes.txt.
 //! Lane backend for the WP9 GLM-5.3 Engine. Grammar masks enable strict auto tools, required/named tools and response_format; lane constrain remains authoritative.
 const std = @import("std");
 const lanes = @import("lanes");

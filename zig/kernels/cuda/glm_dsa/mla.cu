@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Kristian Aaron (Krishando)
+// Modified 2026 in the glm53-tp3-3x-sparks branch (GLM-5.3 on three DGX Sparks); see docs/tp3-changes.txt.
 #include "../tf_vblock.cuh"
 // Adapted from bertholomus/bertholomus/TensorFold@ddfad35:src/tensorfold/families/glm_moe_dsa/cuda/mla_pe.py and dcp.py (Apache-2.0).
 // DCP merge follows ashhart/TensorFold PR #159 by drowzeys (Apache-2.0). Changes: CUDA K3/K4 kernels for this engine.

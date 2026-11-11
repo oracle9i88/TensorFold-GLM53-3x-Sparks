@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Kristian Aaron (Krishando)
+// Modified 2026 in the glm53-tp3-3x-sparks branch (GLM-5.3 on three DGX Sparks); see docs/tp3-changes.txt.
 // Adapted from ashhart/TensorFold@d1018b31: zig/src/families/glm/cuda_follow.zig (Apache-2.0). Changes: defines the DSA rank protocol header and cache-hit messages.
 //! Rank-0 protocol for GLM-5.3 CUDA. Step payloads carry prompt ids and their agreed DCP layout.
 
